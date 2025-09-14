@@ -1,2 +1,12 @@
 .venv/
-data/
+examples/data/
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/
+*.log
+*.sqlite3
+.env
+.env.*
+.ipynb_checkpoints/
