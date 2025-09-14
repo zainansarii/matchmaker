@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+src/matchmaker/__init__.py
+src/matchmaker/data.py
+src/matchmaker.egg-info/PKG-INFO
+src/matchmaker.egg-info/SOURCES.txt
+src/matchmaker.egg-info/dependency_links.txt
+src/matchmaker.egg-info/top_level.txt
