@@ -1,47 +1,44 @@
-from dataclasses import dataclass
-from typing import List, Tuple, Dict
-import numpy as np
-from scipy.sparse import csr_matrix
+# Should this be a class??
 
-class Indexer:
-    def __init__(self):
-        self.to_idx: Dict[str, int] = {}
-        self.to_id: List[str] = []
+import cudf
+import cugraph
 
-    def fit(self, ids: List[str]) -> None:
-        for _id in ids:
-            if _id not in self.to_idx:
-                self.to_idx[_id] = len(self.to_id)
-                self.to_id.append(_id)
+DECIDER_COL_NAME = "decider_id"
+OTHER_COL_NAME = "other_id"
+LIKE_COL_NAME = "interaction_type"
+TIMESTAMP_COL_NAME = "timestamp"
 
-    def get_idx(self, _id: str) -> int:
-        return self.to_idx[_id]
+def _build_graph(interactions_df: cudf.DataFrame, decider_col: str, other_col: str, like_col: str):
+    # Build a directed graph from the interactions DataFrame
+    graph = cugraph.Graph(directed=True)
 
-    def __len__(self) -> int:
-        return len(self.to_id)
+    # Pick 'like' as edge weight
+    graph.from_cudf_edgelist(
+        interactions_df,
+        source=decider_col,
+        destination=other_col,
+        edge_attr=like_col,  # only one column allowed
+        store_transposed=True)
+    
+    return graph
     
 
-@dataclass
-class Interactions:
-    pairs: List[Tuple[str, str]]
+def load_interactions(data_path: str, decider_col: str, other_col: str, like_col: str, timestamp_col: str):
+    # Load interactions data from a CSV file into a cuDF DataFrame
+    interactions = cudf.read_csv(data_path)
 
-    def build_matrix(self) -> Tuple[csr_matrix, Indexer]:
-        users = set()
-        for u, v in self.pairs:
-            users.add(u)
-            users.add(v)
-        indexer = Indexer()
-        indexer.fit(sorted(users))
+    # Select and rename relevant columns
+    interactions = interactions[[decider_col, other_col, like_col, timestamp_col]]
+    interactions = interactions.rename(columns={decider_col: DECIDER_COL_NAME, 
+                                                other_col: OTHER_COL_NAME, 
+                                                like_col: LIKE_COL_NAME,
+                                                timestamp_col: TIMESTAMP_COL_NAME})
+    
+    # Convert timestamp column to datetime
+    interactions = interactions[interactions['timestamp'].notnull()]
+    interactions['timestamp'] = cudf.to_datetime(interactions['timestamp'])
 
-        rows, cols, data = [], [], []
-        for u, v in self.pairs:
-            rows.append(indexer.get_idx(u))
-            cols.append(indexer.get_idx(v))
-            data.append(1.0)
+    graph = _build_graph(interactions, decider_col=DECIDER_COL_NAME, other_col=OTHER_COL_NAME, like_col=LIKE_COL_NAME)
 
-        n = len(indexer)
-        R = csr_matrix((np.array(data), (np.array(rows), np.array(cols))),
-                       shape=(n, n), dtype=np.float32)
-        R.eliminate_zeros()
-        return R, indexer
+    return interactions, graph
 
