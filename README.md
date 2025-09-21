@@ -2,7 +2,7 @@ Lightweight matching engine with evaluation framework.
 
 ## System Requirements
 
-**⚠️ CRITICAL: This library requires a Linux system with NVIDIA GPU and proper drivers**
+**⚠️ IMPORTANT: This library requires a Linux system with NVIDIA GPU and proper drivers ⚠️**
 
 ### Hardware Requirements
 - Linux operating system (Ubuntu 20.04+, RHEL 8+, or equivalent with glibc>=2.28)
