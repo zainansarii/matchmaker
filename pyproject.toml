@@ -4,13 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "matchmaker"
-version = "0.1.0"
-description = "Lightweight matching engine with evaluation framework."
+version = "0.1.1"
+description = "A GPU-accelerated user-to-user recommender engine."
 authors = [
     { name = "Zain Ansari" }
 ]
 readme = "README.md"
 requires-python = ">=3.9"
+
+# These are the HARD requirements for the library.
+# The platform markers prevent installation errors on non-Linux systems.
+dependencies = [
+  "numpy",
+  "pandas",
+  "cupy-cuda12x>=13.0; platform_system=='Linux'",
+  "cudf-cu12>=25.0.0; platform_system=='Linux'",
+  "cugraph-cu12>=25.0.0; platform_system=='Linux'",
+  "cuml-cu12>=25.0.0; platform_system=='Linux'",
+  "rmm-cu12>=25.0.0; platform_system=='Linux'"
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
