@@ -1,13 +1,20 @@
 # This file is for DEVELOPERS of the matchmaker library.
+# Based on official RAPIDS installation guide: https://docs.rapids.ai/install/
 # End-users will install RAPIDS and then 'pip install matchmaker'.
 name: matchmaker-dev
 channels:
   - rapidsai
-  - nvidia
   - conda-forge
+  - nvidia
 dependencies:
   - python=3.10
-  - rapids=25.08 # Pulls in the whole GPU stack for development
+  # RAPIDS with CUDA 12.x support (matches official guide)
+  - rapids=25.08
+  - cuda-version>=12.0,<=12.9
+  # Additional packages for development
+  - networkx
+  - nx-cugraph=25.08
+  - jupyterlab
   - pip
   - pip:
       - -e . # Installs the local 'matchmaker' project in editable mode
