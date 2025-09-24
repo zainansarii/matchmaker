@@ -40,6 +40,9 @@ class DataLoader:
             'data_path': data_path
         }
         
+        # Validate CSV structure first
+        self._validate_csv_structure(data_path, decider_col, other_col, like_col, timestamp_col)
+        
         # Load and preprocess data
         raw_df = cudf.read_csv(data_path)
         self._interactions_df = self._preprocess_interactions(raw_df, decider_col, other_col, like_col, timestamp_col)
@@ -49,6 +52,48 @@ class DataLoader:
         self._build_user_df()
         
         return self
+    
+    def _validate_csv_structure(self, data_path: str, decider_col: str, other_col: str, 
+                               like_col: str, timestamp_col: str) -> None:
+        """Validate that the CSV has the expected structure and data types."""
+        
+        # Check if file exists and is readable
+        try:
+            df = cudf.read_csv(data_path, nrows=5)  # Read just a few rows for validation
+        except FileNotFoundError:
+            raise ValueError(f"File not found: {data_path}")
+        except Exception as e:
+            raise ValueError(f"Cannot read CSV file: {str(e)}")
+        
+        # Check required columns exist
+        required_cols = [decider_col, other_col, like_col, timestamp_col]
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}. Available columns: {list(df.columns)}")
+        
+        # Check data types
+        # decider_col and other_col should be numeric (user IDs)
+        if not df[decider_col].dtype.kind in 'biufc':  # bool, int, uint, float, complex
+            raise ValueError(f"Column '{decider_col}' must be numeric (user ID), got {df[decider_col].dtype}")
+        
+        if not df[other_col].dtype.kind in 'biufc':
+            raise ValueError(f"Column '{other_col}' must be numeric (user ID), got {df[other_col].dtype}")
+        
+        # like_col should be numeric (0/1 values)
+        if not df[like_col].dtype.kind in 'biufc':
+            raise ValueError(f"Column '{like_col}' must be numeric (0/1 values), got {df[like_col].dtype}")
+        
+        # Check like_col values are 0/1 (allowing for some flexibility)
+        like_values = df[like_col].dropna().unique().values_host  # Get host values for iteration
+        valid_like_values = {0, 1, 0.0, 1.0}
+        if not set(like_values).issubset(valid_like_values):
+            raise ValueError(f"Column '{like_col}' should contain only 0/1 values, found: {sorted(like_values)}")
+        
+        # timestamp_col should be convertible to datetime
+        try:
+            cudf.to_datetime(df[timestamp_col].head())
+        except Exception:
+            raise ValueError(f"Column '{timestamp_col}' must be in a valid datetime format")
     
     def _preprocess_interactions(self, df: cudf.DataFrame, decider_col: str, other_col: str, 
                                like_col: str, timestamp_col: str) -> cudf.DataFrame:
@@ -95,7 +140,7 @@ class DataLoader:
         # Combine and deduplicate
         all_users = cudf.concat([deciders, others], ignore_index=True)
         self._user_df = all_users.drop_duplicates().reset_index(drop=True)
-    
+
     @property
     def interactions_df(self) -> cudf.DataFrame:
         """Get the processed interactions DataFrame."""
