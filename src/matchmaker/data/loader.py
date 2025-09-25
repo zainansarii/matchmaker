@@ -13,7 +13,6 @@ class DataLoader:
     def __init__(self):
         self._interactions_df: Optional[cudf.DataFrame] = None
         self._user_df: Optional[cudf.DataFrame] = None
-        self._interaction_graph: Optional[cugraph.Graph] = None
         self._metadata = {}
     
     def load_interactions(self, data_path: str, decider_col: str, other_col: str, 
@@ -47,8 +46,7 @@ class DataLoader:
         raw_df = cudf.read_csv(data_path)
         self._interactions_df = self._preprocess_interactions(raw_df, decider_col, other_col, like_col, timestamp_col)
         
-        # Build derived data structures
-        self._build_graph()
+        # Build user DataFrame
         self._build_user_df()
         
         return self
@@ -107,24 +105,6 @@ class DataLoader:
         
         return interactions
     
-    def _build_graph(self):
-        """Build a directed graph from the interactions DataFrame."""
-        if self._interactions_df is None:
-            raise ValueError("No interactions data available")
-            
-        graph = cugraph.Graph(directed=True)
-        
-        # Build graph with interaction type as edge weight
-        graph.from_cudf_edgelist(
-            self._interactions_df,
-            source=self._metadata['decider_col'],
-            destination=self._metadata['other_col'],
-            edge_attr=self._metadata['like_col'],
-            store_transposed=True
-        )
-        
-        self._interaction_graph = graph
-    
     def _build_user_df(self):
         """Extract unique users from interactions."""
         if self._interactions_df is None:
@@ -154,13 +134,6 @@ class DataLoader:
         if self._user_df is None:
             raise ValueError("No data loaded. Call load_interactions() first.")
         return self._user_df
-    
-    @property
-    def interactions_graph(self) -> cugraph.Graph:
-        """Get the interaction graph."""
-        if self._interaction_graph is None:
-            raise ValueError("No graph available. Call load_interactions() first.")
-        return self._interaction_graph
     
     @property
     def metadata(self) -> dict:

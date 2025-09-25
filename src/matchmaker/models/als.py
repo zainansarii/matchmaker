@@ -6,7 +6,7 @@ from implicit.als import AlternatingLeastSquares
 import warnings
 warnings.filterwarnings('ignore')
 
-class DatingAppCollaborativeFilter:
+class ALS:
     """
     GPU-accelerated collaborative filtering for dating app recommendations.
     Uses Implicit ALS with square user-user matrix structure.
