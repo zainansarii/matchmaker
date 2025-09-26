@@ -1,4 +1,7 @@
-Lightweight matching engine with evaluation framework.
+# Matchmaker™ 💞
+
+A GPU-accelerated user/user matching engine with evaluation framework designed for building recommendation systems and analysing user interaction patterns.
+
 
 ## System Requirements
 
@@ -8,8 +11,7 @@ Lightweight matching engine with evaluation framework.
 - Linux operating system (Ubuntu 20.04+, RHEL 8+, or equivalent with glibc>=2.28)
 - NVIDIA GPU with compute capability 7.0+ (Volta™ architecture or newer)
 - Compatible GPUs include: RTX 20xx/30xx/40xx series, Tesla V100+, A100, H100, L4, etc.
-- At least 8GB GPU memory recommended
-- 16GB+ system RAM
+- At least 8GB GPU RAM / 16GB system RAM recommended
 
 ### CUDA & NVIDIA Driver Requirements
 
@@ -111,81 +113,6 @@ python -c "import cupy; print(f'CuPy version: {cupy.__version__}'); print(f'CUDA
 # Test matchmaker import
 python -c "from matchmaker import matchmaker; print('Matchmaker imported successfully')"
 ```
-
-## Troubleshooting
-
-### NVIDIA Driver Issues
-- **"nvidia-smi: command not found"**: NVIDIA drivers not installed
-- **"CUDA driver version is insufficient"**: Driver version too old for CUDA 12+
-- **"No NVIDIA GPU detected"**: GPU not visible to drivers
-
-**Solution**: Install/update NVIDIA drivers to version 525.60.13 or newer
-
-### RAPIDS/Conda Environment Issues
-
-#### Conda Create Error
-```bash
-# Update conda to latest version (includes libmamba solver)
-conda update conda
-
-# OR use mamba directly (faster)
-conda install mamba -n base -c conda-forge
-mamba env create -f environment.yml
-```
-
-#### CUDA Constraint Conflicts
-If you see `__cuda` constraint conflicts:
-```bash
-# Check detected CUDA version
-conda info
-
-# Override if conda misdetected CUDA version
-export CONDA_OVERRIDE_CUDA="12.0"
-conda env create -f environment.yml
-```
-
-#### Packages from 'defaults' Channel
-RAPIDS requires `conda-forge` channel, not `defaults`:
-```bash
-# Check for packages from defaults channel
-conda list | grep defaults
-
-# If found, recreate environment or modify .condarc:
-conda config --remove channels defaults
-conda config --add channels conda-forge
-conda config --add channels nvidia
-conda config --add channels rapidsai
-```
-
-### CuPy/CUDA Package Conflicts
-If you see warnings about multiple CuPy packages:
-```bash
-# Clean up all CUDA/CuPy packages
-conda activate matchmaker-dev
-pip uninstall cupy cupy-cuda11x cupy-cuda12x -y
-conda uninstall cupy -y
-
-# Recreate environment from scratch
-conda env remove -n matchmaker-dev
-conda env create -f environment.yml
-```
-
-### Import/Runtime Errors
-```bash
-# Verify RAPIDS installation
-python -c "import cudf, cuml, cugraph; print('RAPIDS OK')"
-
-# Check CUDA runtime version
-python -c "import cupy; print(f'CUDA Runtime: {cupy.cuda.runtime.runtimeGetVersion()}')"
-
-# Verify GPU memory
-python -c "import cupy; print(f'GPU Memory: {cupy.cuda.Device().mem_info}')"
-```
-
-### Performance Issues
-- **Slow environment solving**: Use `mamba` instead of `conda`
-- **Out of GPU memory**: Reduce batch sizes or use system with more GPU RAM
-- **Slow data loading**: Use NVMe SSD storage when possible
 
 **Important Notes**:
 - The environment uses official RAPIDS 25.08 with CUDA 12.x support
