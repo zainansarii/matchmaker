@@ -79,39 +79,6 @@ class InteractionGraph:
         pagerank_df = pagerank_df.rename(columns={'vertex': 'user_id'})
         return pagerank_df
     
-    def get_like_stats(self) -> cudf.DataFrame:
-        """
-        Calculate like statistics for users based on interactions.
-        
-        Returns:
-            DataFrame containing user_id, likes_received, likes_given, and like_ratio
-        """
-        if not self.is_built():
-            raise ValueError("Graph not built. Call build_graph() first.")
-            
-        decider_col = self._metadata['decider_col']
-        other_col = self._metadata['other_col']
-        like_col = self._metadata['like_col']
-        
-        # Likes received per user
-        likes_received = self._interactions_df.groupby(other_col)[like_col].sum().reset_index()
-        likes_received = likes_received.rename(columns={other_col: 'user_id', like_col: 'likes_received'})
-
-        # Likes given per user
-        likes_given = self._interactions_df.groupby(decider_col)[like_col].sum().reset_index()
-        likes_given = likes_given.rename(columns={decider_col: 'user_id', like_col: 'likes_given'})
-
-        # Merge like stats together
-        like_stats_df = likes_received.merge(likes_given, on='user_id', how='outer')
-
-        # Fill NaNs with 0
-        like_stats_df = like_stats_df.fillna(0)
-
-        # Compute like ratio (add small epsilon to avoid div by 0)
-        like_stats_df['like_ratio'] = like_stats_df['likes_received'] / (like_stats_df['likes_given'] + 1e-6)
-
-        return like_stats_df[['user_id', 'likes_received', 'likes_given', 'like_ratio']]
-    
     def get_degree_centrality(self) -> cudf.DataFrame:
         """
         Calculate degree centrality for users in the graph.

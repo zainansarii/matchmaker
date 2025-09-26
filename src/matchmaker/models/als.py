@@ -6,7 +6,7 @@ from implicit.als import AlternatingLeastSquares
 import warnings
 warnings.filterwarnings('ignore')
 
-class ALS:
+class ALSModel:
     """
     GPU-accelerated collaborative filtering for dating app recommendations.
     Uses Implicit ALS with square user-user matrix structure.
@@ -90,9 +90,9 @@ class ALS:
             return factors
     
     def fit(self, interactions, 
-            user_col='decidermemberid', 
-            target_col='othermemberid', 
-            value_col='like',
+            user_col,
+            target_col, 
+            value_col,
             min_interactions=2):
         """
         Fit the collaborative filtering model on interaction data.

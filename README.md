@@ -34,7 +34,6 @@ sudo apt update
 
 # Install NVIDIA drivers (automatically selects appropriate version)
 sudo ubuntu-drivers autoinstall
-
 # OR install specific version
 ubuntu-drivers devices  # Check available drivers
 sudo apt install nvidia-driver-XXX  # Replace XXX with version number
@@ -73,7 +72,9 @@ RAPIDS recommends using Miniforge over Miniconda/Anaconda for better compatibili
 curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
 bash "Miniforge3-$(uname)-$(uname -m).sh"
 
-# Follow installation prompts and enable conda-init
+# Follow installation prompts and enable conda
+source ~/miniforge3/bin/activate
+
 # Close and reopen terminal
 ```
 
@@ -108,7 +109,7 @@ python -c "import cudf; print(cudf.Series([1, 2, 3]))"
 python -c "import cupy; print(f'CuPy version: {cupy.__version__}'); print(f'CUDA device: {cupy.cuda.device.Device().id}')"
 
 # Test matchmaker import
-python -c "from matchmaker import matchmaker; print('Matchmaker imported successfully!')"
+python -c "from matchmaker import matchmaker; print('Matchmaker imported successfully')"
 ```
 
 ## Troubleshooting

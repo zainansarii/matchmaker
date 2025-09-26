@@ -15,6 +15,7 @@ dependencies:
   - networkx
   - nx-cugraph=25.08
   - jupyterlab
+  - implicit
   - pip
   - pip:
       - -e . # Installs the local 'matchmaker' project in editable mode

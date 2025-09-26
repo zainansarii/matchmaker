@@ -2,6 +2,7 @@ import pandas as pd
 
 from .data.loader import DataLoader
 from .models.graph import InteractionGraph
+from .models.als import ALSModel
 
 
 class MatchingEngine:
@@ -10,6 +11,7 @@ class MatchingEngine:
     def __init__(self):
         self.data_loader = DataLoader()
         self.interaction_graph = InteractionGraph()
+        self.als_model = ALSModel()
         self.interactions_df = None
         self.user_df = None
 
@@ -21,25 +23,36 @@ class MatchingEngine:
                           timestamp_col: str
                           ) -> None:
         """
-        Loads data and builds the interaction matrix.
+        Loads data into interaction matrix, interaction graph, and fits ALS
         """
         try:
+            print("Reading data... ", end="")
             # Load the data (validation happens inside DataLoader)
             self.data_loader.load_interactions(data_path, decider_col, other_col, like_col, timestamp_col)
-            
             # Populate class attributes after loading
             self.interactions_df = self.data_loader.interactions_df
             self.user_df = self.data_loader.user_df
-            
-            # Build the interaction graph
+            print("✅")
+
+            print("Constructing graph...", end="")
             self.interaction_graph.build_graph(
                 self.interactions_df, 
                 decider_col, 
                 other_col, 
                 like_col
             )
+            print("✅")
+
+            print("Fitting ALS... ", end="")
+            self.als_model.fit(
+                self.interactions_df, 
+                decider_col, 
+                other_col, 
+                like_col
+            )
+            print("✅")
             
-            print("Data Loaded ✅")
+            print("Complete!")
             
         except ValueError:
             # ValueError is raised by our validation - just show the custom message without traceback
@@ -65,10 +78,6 @@ class MatchingEngine:
         # Calculate PageRank as a measure of popularity
         pagerank_scores = self.interaction_graph.get_pagerank()
         self.user_df = self.user_df.merge(pagerank_scores, on='user_id', how='left')
-
-        # Calculate Like Stats
-        like_stats = self.interaction_graph.get_like_stats()
-        self.user_df = self.user_df.merge(like_stats, on='user_id', how='left')
 
         return self.user_df
 
