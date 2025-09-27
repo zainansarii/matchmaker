@@ -11,7 +11,7 @@ class DataLoader:
     """Handles loading and preprocessing of interaction data."""
     
     def __init__(self):
-        self._interactions_df: Optional[cudf.DataFrame] = None
+        self._interaction_df: Optional[cudf.DataFrame] = None
         self._user_df: Optional[cudf.DataFrame] = None
         self._metadata = {}
     
@@ -44,7 +44,7 @@ class DataLoader:
         
         # Load and preprocess data
         raw_df = cudf.read_csv(data_path)
-        self._interactions_df = self._preprocess_interactions(raw_df, decider_col, other_col, like_col, timestamp_col)
+        self._interaction_df = self._preprocess_interactions(raw_df, decider_col, other_col, like_col, timestamp_col)
         
         # Build user DataFrame
         self._build_user_df()
@@ -107,26 +107,26 @@ class DataLoader:
     
     def _build_user_df(self):
         """Extract unique users from interactions."""
-        if self._interactions_df is None:
+        if self._interaction_df is None:
             raise ValueError("No interactions data available")
             
         # Get unique users from both decider and other columns
         decider_col = self._metadata['decider_col']
         other_col = self._metadata['other_col']
         
-        deciders = self._interactions_df[[decider_col]].rename(columns={decider_col: 'user_id'})
-        others = self._interactions_df[[other_col]].rename(columns={other_col: 'user_id'})
+        deciders = self._interaction_df[[decider_col]].rename(columns={decider_col: 'user_id'})
+        others = self._interaction_df[[other_col]].rename(columns={other_col: 'user_id'})
         
         # Combine and deduplicate
         all_users = cudf.concat([deciders, others], ignore_index=True)
         self._user_df = all_users.drop_duplicates().reset_index(drop=True)
 
     @property
-    def interactions_df(self) -> cudf.DataFrame:
+    def interaction_df(self) -> cudf.DataFrame:
         """Get the processed interactions DataFrame."""
-        if self._interactions_df is None:
+        if self._interaction_df is None:
             raise ValueError("No data loaded. Call load_interactions() first.")
-        return self._interactions_df
+        return self._interaction_df
     
     @property
     def user_df(self) -> cudf.DataFrame:
@@ -142,7 +142,7 @@ class DataLoader:
     
     def is_loaded(self) -> bool:
         """Check if data has been loaded."""
-        return self._interactions_df is not None
+        return self._interaction_df is not None
     
     def get_user_interactions(self, user_id: int, as_decider: bool = True) -> cudf.DataFrame:
         """
@@ -160,4 +160,4 @@ class DataLoader:
             raise ValueError("No data loaded. Call load_interactions() first.")
             
         col_name = self._metadata['decider_col'] if as_decider else self._metadata['other_col']
-        return self._interactions_df[self._interactions_df[col_name] == user_id]
+        return self._interaction_df[self._interaction_df[col_name] == user_id]

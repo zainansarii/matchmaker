@@ -16,6 +16,7 @@ dependencies:
   - nx-cugraph=25.08
   - jupyterlab
   - implicit
+  - plotly
   - pip
   - pip:
       - -e . # Installs the local 'matchmaker' project in editable mode

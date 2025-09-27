@@ -12,7 +12,7 @@ class MatchingEngine:
         self.data_loader = DataLoader()
         self.interaction_graph = InteractionGraph()
         self.als_model = ALSModel()
-        self.interactions_df = None
+        self.interaction_df = None
         self.user_df = None
 
     def load_interactions(self, 
@@ -30,13 +30,13 @@ class MatchingEngine:
             # Load the data (validation happens inside DataLoader)
             self.data_loader.load_interactions(data_path, decider_col, other_col, like_col, timestamp_col)
             # Populate class attributes after loading
-            self.interactions_df = self.data_loader.interactions_df
+            self.interaction_df = self.data_loader.interaction_df
             self.user_df = self.data_loader.user_df
             print("✅")
 
             print("Constructing graph...", end="")
             self.interaction_graph.build_graph(
-                self.interactions_df, 
+                self.interaction_df, 
                 decider_col, 
                 other_col, 
                 like_col
@@ -45,14 +45,12 @@ class MatchingEngine:
 
             print("Fitting ALS... ", end="")
             self.als_model.fit(
-                self.interactions_df, 
+                self.interaction_df, 
                 decider_col, 
                 other_col, 
                 like_col
-            )
-            print("✅")
-            
-            print("Complete!")
+            )            
+            print("Complete! ✅")
             
         except ValueError:
             # ValueError is raised by our validation - just show the custom message without traceback
