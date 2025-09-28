@@ -1,8 +1,9 @@
-import pandas as pd
+import pandas as pd  # type: ignore[import]
 
 from .data.loader import DataLoader
 from .models.graph import InteractionGraph
 from .models.als import ALSModel
+from .models.engagement import EngagementScorer, EngagementConfig
 
 
 class MatchingEngine:
@@ -12,6 +13,7 @@ class MatchingEngine:
         self.data_loader = DataLoader()
         self.interaction_graph = InteractionGraph()
         self.als_model = ALSModel()
+        self.engagement_model = EngagementScorer()
         self.interaction_df = None
         self.user_df = None
 
@@ -77,6 +79,30 @@ class MatchingEngine:
         pagerank_scores = self.interaction_graph.get_pagerank()
         self.user_df = self.user_df.merge(pagerank_scores, on='user_id', how='left')
 
+        return self.user_df
+
+    def run_engagement(self, config: EngagementConfig | None = None) -> pd.DataFrame:
+        """Compute engagement scores and merge them into the user feature table."""
+
+        if not self.is_ready():
+            raise ValueError("Data not loaded. Call load_interactions() first.")
+
+        metadata = self.data_loader.metadata
+        decider_col = metadata['decider_col']
+        like_col = metadata['like_col']
+        timestamp_col = metadata.get('timestamp_col')
+
+        if config is not None:
+            self.engagement_model = EngagementScorer(config)
+
+        engagement_scores = self.engagement_model.score(
+            self.interaction_df,
+            decider_col=decider_col,
+            like_col=like_col,
+            timestamp_col=timestamp_col,
+        )
+
+        self.user_df = self.user_df.merge(engagement_scores, on='user_id', how='left')
         return self.user_df
 
     def is_ready(self) -> bool:
