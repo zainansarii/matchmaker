@@ -79,7 +79,7 @@ class MatchingEngine:
         pagerank_scores = self.interaction_graph.get_pagerank()
         self.user_df = self.user_df.merge(pagerank_scores, on='user_id', how='left')
 
-        return self.user_df
+        print("User DF updated ✅")
 
     def run_engagement(self, config: EngagementConfig | None = None) -> pd.DataFrame:
         """Compute engagement scores and merge them into the user feature table."""
@@ -103,7 +103,8 @@ class MatchingEngine:
         )
 
         self.user_df = self.user_df.merge(engagement_scores, on='user_id', how='left')
-        return self.user_df
+
+        print("User DF updated ✅")
 
     def is_ready(self) -> bool:
         """Check if data is loaded and ready for matching."""
