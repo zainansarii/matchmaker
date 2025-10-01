@@ -385,39 +385,6 @@ class ALSModel:
         
         return results[:N]
     
-    def get_user_stats(self, user_id):
-        """
-        Get statistics for a specific user.
-        
-        Args:
-            user_id: User ID to get stats for
-        
-        Returns:
-            Dictionary with user statistics
-        """
-        if user_id not in self.user2idx:
-            return None
-        
-        user_idx = self.user2idx[user_id]
-        
-        # Count likes given (row in matrix)
-        user_row = self.user_user_matrix[user_idx]
-        likes_given = (user_row.data > 1).sum()
-        total_evaluated = user_row.nnz
-        
-        # Count likes received (column in matrix)
-        user_col = self.user_user_matrix[:, user_idx]
-        likes_received = (user_col.data > 1).sum()
-        
-        return {
-            'user_id': user_id,
-            'profiles_evaluated': int(total_evaluated),
-            'likes_given': int(likes_given),
-            'likes_received': int(likes_received),
-            'like_rate': float(likes_given / max(total_evaluated, 1)),
-            'selectivity': 1.0 - float(likes_given / max(total_evaluated, 1))
-        }
-    
     def explain_recommendation(self, user_id, recommended_user_id, N=5):
         """
         Explain why a user was recommended to another user.
