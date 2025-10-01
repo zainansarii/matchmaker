@@ -26,7 +26,7 @@ class EngagementConfig:
 
     activity_weight: float = 0.6
     intentionality_weight: float = 0.4
-    min_swipes: int = 3
+    min_swipes: int = 1
     recency_halflife_days: Optional[float] = 30.0
 
     # Quantiles for shaping curves (data-driven instead of hard thresholds)

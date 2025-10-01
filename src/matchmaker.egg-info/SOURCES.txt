@@ -10,5 +10,5 @@ src/matchmaker.egg-info/top_level.txt
 src/matchmaker/data/loader.py
 src/matchmaker/models/als.py
 src/matchmaker/models/engagement.py
-src/matchmaker/models/graph.py
+src/matchmaker/models/popularity.py
 src/matchmaker/utils/helpers.py

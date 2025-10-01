@@ -1,7 +1,7 @@
 import pandas as pd  # type: ignore[import]
 
 from .data.loader import DataLoader
-from .models.graph import InteractionGraph
+from .models.popularity import InteractionGraph, get_like_stats
 from .models.als import ALSModel
 from .models.engagement import EngagementScorer, EngagementConfig
 
@@ -75,9 +75,37 @@ class MatchingEngine:
         Returns:
             pd.DataFrame: DataFrame containing user features based on popularity models.
         """
-        # Calculate PageRank as a measure of popularity
+        # Remove existing popularity columns to avoid conflicts
+        popularity_columns = ['pagerank', 'likes_received', 'swipes_received', 'weighted_likes_received', 
+                            'weighted_swipes_received', 'in_like_rate_raw', 'in_like_rate_weighted',
+                            'in_like_rate_smoothed', 'popularity_confidence', 'popularity_score']
+        
+        existing_columns = list(self.user_df.columns)
+        columns_to_drop = [col for col in existing_columns if any(pop_col in col for pop_col in popularity_columns)]
+        
+        if columns_to_drop:
+            self.user_df = self.user_df.drop(columns=columns_to_drop)
+        
+        # Calculate PageRank as a measure of popularity (from graph class)
         pagerank_scores = self.interaction_graph.get_pagerank()
         self.user_df = self.user_df.merge(pagerank_scores, on='user_id', how='left')
+
+        # Calculate in-like rate statistics (standalone function)
+        decider_col = self.data_loader.metadata['decider_col']
+        other_col = self.data_loader.metadata['other_col']
+        like_col = self.data_loader.metadata['like_col']
+        timestamp_col = self.data_loader.metadata['timestamp_col']
+        
+        like_stats = get_like_stats(
+            self.interaction_df, 
+            decider_col, 
+            other_col, 
+            like_col, 
+            timestamp_col=timestamp_col,
+            recency_halflife_days=30.0,
+            min_swipes=3
+        )
+        self.user_df = self.user_df.merge(like_stats, on='user_id', how='left')
 
         print("User DF updated ✅")
 
