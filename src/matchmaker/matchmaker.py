@@ -96,7 +96,7 @@ class MatchingEngine:
         if columns_to_drop:
             self.user_df = self.user_df.drop(columns=columns_to_drop)
         
-    # Calculate PageRank as a measure of popularity (from graph class)
+        # Calculate PageRank as a measure of popularity (from graph class)
         pagerank_scores = self.interaction_graph.get_pagerank()
         self.user_df = self.user_df.merge(pagerank_scores, on='user_id', how='left')
 
@@ -125,7 +125,7 @@ class MatchingEngine:
             # Don't fail the pipeline if leagues can't be assigned; just log
             print(f"⚠️ League assignment skipped: {e}")
 
-    print("User DF updated ✅")
+        print("User DF updated ✅")
 
     def run_engagement(self, config: EngagementConfig | None = None) -> pd.DataFrame:
         """Compute engagement scores and merge them into the user feature table."""
