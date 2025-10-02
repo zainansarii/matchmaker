@@ -356,4 +356,72 @@ def get_like_stats(interactions_df: cudf.DataFrame, decider_col: str, other_col:
                   'in_like_rate_smoothed', 'popularity_confidence', 'popularity_score']]
 
 
+def assign_balanced_leagues(
+    user_df: cudf.DataFrame,
+    *,
+    pagerank_col: str = 'pagerank',
+    gender_col: str = 'gender',
+    quantiles = (0.0, 0.3, 0.5, 0.7, 0.9, 1.0),
+    labels = ("Bronze", "Silver", "Gold", "Platinum", "Diamond"),
+) -> cudf.DataFrame:
+    """
+    Assign league tiers based on PageRank, preserving gender proportions within each tier.
+
+    Expects user_df to contain columns: 'user_id', pagerank_col, gender_col.
+    Returns a cudf.DataFrame with columns ['user_id', 'league'] suitable for merging.
+    """
+    # Filter to rows with both pagerank and gender
+    cols = ['user_id', pagerank_col, gender_col]
+    for c in cols:
+        if c not in user_df.columns:
+            raise ValueError(f"assign_balanced_leagues requires column: {c}")
+
+    df = user_df[cols].dropna(subset=[pagerank_col, gender_col])
+    if len(df) == 0:
+        return cudf.DataFrame({'user_id': [], 'league': []})
+
+    # Convert minimal frame to pandas for qcut; this is small (~users only)
+    import pandas as pd  # local import to avoid global dependency
+    pdf = df.to_pandas()
+
+    parts = []
+    for g in pdf[gender_col].dropna().unique().tolist():
+        sub = pdf[pdf[gender_col] == g].copy()
+        if len(sub) < 2:
+            # Not enough records to form bins
+            sub['league'] = labels[0]
+            parts.append(sub[['user_id', 'league']])
+            continue
+
+        try:
+            # First, compute quantile-based bins without labels so pandas decides actual bin edges
+            cats = pd.qcut(
+                sub[pagerank_col],
+                q=quantiles,
+                labels=None,
+                duplicates='drop'
+            )
+
+            # Determine actual number of bins created (can be fewer due to duplicate edges)
+            num_bins = len(cats.cat.categories)
+            if num_bins <= 0:
+                sub['league'] = labels[0]
+            else:
+                # Slice labels to the exact number of bins and rename categories accordingly
+                sliced_labels = list(labels)[:num_bins]
+                sub['league'] = cats.cat.rename_categories(sliced_labels)
+        except Exception:
+            # Fallback: assign everyone to base tier for this gender on any unexpected error
+            sub['league'] = labels[0]
+
+        parts.append(sub[['user_id', 'league']])
+
+    if not parts:
+        raise ValueError("No valid genders found in data for league assignment")
+
+    result_pdf = pd.concat(parts, axis=0, ignore_index=True)
+    result_cudf = cudf.from_pandas(result_pdf[['user_id', 'league']])
+    return result_cudf
+
+
 

@@ -1,7 +1,8 @@
 import pandas as pd  # type: ignore[import]
+from typing import Optional
 
 from .data.loader import DataLoader
-from .models.popularity import InteractionGraph, get_like_stats
+from .models.popularity import InteractionGraph, get_like_stats, assign_balanced_leagues
 from .models.als import ALSModel
 from .models.engagement import EngagementScorer, EngagementConfig
 
@@ -22,15 +23,24 @@ class MatchingEngine:
                           decider_col: str, 
                           other_col: str, 
                           like_col: str,
-                          timestamp_col: str
+                          timestamp_col: str,
+                          gender_col: Optional[str] = None
                           ) -> None:
         """
         Loads data into interaction matrix, interaction graph, and fits ALS
+        
+        Args:
+            data_path: Path to CSV file containing interaction data
+            decider_col: Column name for the user making the decision
+            other_col: Column name for the target user
+            like_col: Column name for the interaction type (like/dislike)  
+            timestamp_col: Column name for the timestamp
+            gender_col: Column name for the decider's gender (will infer other genders assuming heterosexual interactions)
         """
         try:
             print("Reading data... ", end="")
             # Load the data (validation happens inside DataLoader)
-            self.data_loader.load_interactions(data_path, decider_col, other_col, like_col, timestamp_col)
+            self.data_loader.load_interactions(data_path, decider_col, other_col, like_col, timestamp_col, gender_col)
             # Populate class attributes after loading
             self.interaction_df = self.data_loader.interaction_df
             self.user_df = self.data_loader.user_df
@@ -86,7 +96,7 @@ class MatchingEngine:
         if columns_to_drop:
             self.user_df = self.user_df.drop(columns=columns_to_drop)
         
-        # Calculate PageRank as a measure of popularity (from graph class)
+    # Calculate PageRank as a measure of popularity (from graph class)
         pagerank_scores = self.interaction_graph.get_pagerank()
         self.user_df = self.user_df.merge(pagerank_scores, on='user_id', how='left')
 
@@ -107,7 +117,15 @@ class MatchingEngine:
         )
         self.user_df = self.user_df.merge(like_stats, on='user_id', how='left')
 
-        print("User DF updated ✅")
+        # Assign balanced leagues by gender using PageRank
+        try:
+            leagues = assign_balanced_leagues(self.user_df, pagerank_col='pagerank', gender_col='gender')
+            self.user_df = self.user_df.merge(leagues, on='user_id', how='left')
+        except Exception as e:
+            # Don't fail the pipeline if leagues can't be assigned; just log
+            print(f"⚠️ League assignment skipped: {e}")
+
+    print("User DF updated ✅")
 
     def run_engagement(self, config: EngagementConfig | None = None) -> pd.DataFrame:
         """Compute engagement scores and merge them into the user feature table."""

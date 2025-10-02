@@ -16,7 +16,7 @@ class DataLoader:
         self._metadata = {}
     
     def load_interactions(self, data_path: str, decider_col: str, other_col: str, 
-                         like_col: str, timestamp_col: str) -> 'DataLoader':
+                         like_col: str, timestamp_col: str, gender_col: Optional[str] = None) -> 'DataLoader':
         """
         Load interaction data and build graph representation.
         
@@ -26,6 +26,7 @@ class DataLoader:
             other_col: Column name for the target user
             like_col: Column name for the interaction type (like/dislike)
             timestamp_col: Column name for the timestamp
+            gender_col: Column name for the decider's gender (optional)
             
         Returns:
             Self for method chaining
@@ -36,23 +37,23 @@ class DataLoader:
             'other_col': other_col, 
             'like_col': like_col,
             'timestamp_col': timestamp_col,
+            'gender_col': gender_col,
             'data_path': data_path
         }
         
-        # Validate CSV structure first
-        self._validate_csv_structure(data_path, decider_col, other_col, like_col, timestamp_col)
-        
         # Load and preprocess data
         raw_df = cudf.read_csv(data_path)
-        self._interaction_df = self._preprocess_interactions(raw_df, decider_col, other_col, like_col, timestamp_col)
-        
+        self._interaction_df = self._preprocess_interactions(
+            raw_df, decider_col, other_col, like_col, timestamp_col, gender_col
+        )
+
         # Build user DataFrame
         self._build_user_df()
-        
+
         return self
     
     def _validate_csv_structure(self, data_path: str, decider_col: str, other_col: str, 
-                               like_col: str, timestamp_col: str) -> None:
+                               like_col: str, timestamp_col: str, gender_col: Optional[str] = None) -> None:
         """Validate that the CSV has the expected structure and data types."""
         
         # Check if file exists and is readable
@@ -65,6 +66,8 @@ class DataLoader:
         
         # Check required columns exist
         required_cols = [decider_col, other_col, like_col, timestamp_col]
+        if gender_col:
+            required_cols.append(gender_col)
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             raise ValueError(f"Missing required columns: {missing_cols}. Available columns: {list(df.columns)}")
@@ -92,34 +95,100 @@ class DataLoader:
             cudf.to_datetime(df[timestamp_col].head())
         except Exception:
             raise ValueError(f"Column '{timestamp_col}' must be in a valid datetime format")
+        
+        # Validate gender column if provided
+        if gender_col:
+            gender_values = df[gender_col].dropna().unique().values_host
+            valid_genders = {'M', 'F', 'm', 'f', 'Male', 'Female', 'male', 'female'}
+            if not set(gender_values).issubset(valid_genders):
+                raise ValueError(f"Column '{gender_col}' should contain gender values (M/F, Male/Female), found: {sorted(gender_values)}")
     
     def _preprocess_interactions(self, df: cudf.DataFrame, decider_col: str, other_col: str, 
-                               like_col: str, timestamp_col: str) -> cudf.DataFrame:
-        """Preprocess raw interaction data."""
-        # Select relevant columns without renaming
-        interactions = df[[decider_col, other_col, like_col, timestamp_col]].copy()
-        
+                               like_col: str, timestamp_col: str, gender_col: Optional[str] = None) -> cudf.DataFrame:
+        """Preprocess raw interaction data with CPU-assisted gender mapping to avoid GPU OOM.
+
+        - Interactions: processed entirely on GPU (cuDF)
+        - Gender: compact mapping computed on CPU (pandas) and moved back to GPU
+        """
+
+        # Process gender data on CPU to avoid massive GPU memory allocations during joins
+        if gender_col:
+            # Keep only unique pairs to minimize memory
+            gender_pairs = df[[decider_col, gender_col]].drop_duplicates()
+            gender_df_cpu = gender_pairs.to_pandas()
+
+            # Normalize gender labels on CPU and move compact mapping back to GPU
+            gender_df_cpu['gender'] = gender_df_cpu[gender_col].replace({
+                'M': 'M', 'F': 'F', 'm': 'M', 'f': 'F',
+                'Male': 'M', 'Female': 'F', 'male': 'M', 'female': 'F'
+            })
+            self._raw_gender_data = cudf.from_pandas(
+                gender_df_cpu[[decider_col, 'gender']]
+            )
+        else:
+            self._raw_gender_data = None
+
+        # Process interactions - select only needed columns to minimize memory
+        interactions = df[[decider_col, other_col, like_col, timestamp_col]]
+
         # Clean and convert timestamp
-        interactions = interactions[interactions[timestamp_col].notnull()]
+        interactions = interactions.dropna(subset=[timestamp_col])
         interactions[timestamp_col] = cudf.to_datetime(interactions[timestamp_col])
-        
+
         return interactions
     
     def _build_user_df(self):
-        """Extract unique users from interactions."""
+        """Extract unique users and attach gender without GPU joins (memory-safe).
+
+        Strategy:
+        - Build decider->gender mapping on CPU
+        - Sample one decider per 'other' on GPU, then map genders on CPU to infer other->gender
+        - Combine into final user_df with user_id and optional gender
+        """
         if self._interaction_df is None:
             raise ValueError("No interactions data available")
             
         # Get unique users from both decider and other columns
         decider_col = self._metadata['decider_col']
         other_col = self._metadata['other_col']
-        
+
+        # Base users set (GPU)
         deciders = self._interaction_df[[decider_col]].rename(columns={decider_col: 'user_id'})
         others = self._interaction_df[[other_col]].rename(columns={other_col: 'user_id'})
-        
-        # Combine and deduplicate
-        all_users = cudf.concat([deciders, others], ignore_index=True)
-        self._user_df = all_users.drop_duplicates().reset_index(drop=True)
+        all_users = cudf.concat([deciders, others], ignore_index=True).drop_duplicates().reset_index(drop=True)
+
+        # If no gender data provided, finish early
+        if not (hasattr(self, '_raw_gender_data') and self._raw_gender_data is not None):
+            self._user_df = all_users
+            return
+
+        # Step 1: decider -> gender dictionary (CPU)
+        decider_ids_cpu = self._raw_gender_data[decider_col].to_pandas()
+        decider_gender_cpu = self._raw_gender_data['gender'].to_pandas()
+        decider_gender_dict = dict(zip(decider_ids_cpu, decider_gender_cpu))
+
+        # Step 2: sample one decider per unique 'other' (GPU), then map on CPU
+        # This avoids creating a huge join on GPU.
+        sample_pairs = self._interaction_df[[other_col, decider_col]].drop_duplicates(subset=[other_col])
+        sample_pairs_cpu = sample_pairs.to_pandas()
+
+        # Infer other -> gender by flipping decider's gender (heterosexual assumption)
+        other_gender_cpu = (
+            sample_pairs_cpu[decider_col]
+            .map(decider_gender_dict)
+            .map({'M': 'F', 'F': 'M'})
+        )
+        other_gender_dict = dict(zip(sample_pairs_cpu[other_col], other_gender_cpu))
+
+        # Step 3: build final user_df by mapping in order of precedence
+        user_ids_cpu = all_users['user_id'].to_pandas()
+        genders_cpu = [
+            decider_gender_dict.get(uid, other_gender_dict.get(uid))
+            for uid in user_ids_cpu
+        ]
+
+        all_users['gender'] = cudf.Series(genders_cpu)
+        self._user_df = all_users
 
     @property
     def interaction_df(self) -> cudf.DataFrame:
