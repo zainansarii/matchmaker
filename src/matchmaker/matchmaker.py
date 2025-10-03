@@ -1,10 +1,11 @@
 import pandas as pd  # type: ignore[import]
-from typing import Optional
+from typing import Optional, List, Tuple, Dict
 
 from .data.loader import DataLoader
 from .models.popularity import InteractionGraph, get_like_stats, assign_balanced_leagues
 from .models.als import ALSModel
 from .models.engagement import EngagementScorer, EngagementConfig
+from .models.recommender import LeagueFilteredRecommender
 
 
 class MatchingEngine:
@@ -15,6 +16,7 @@ class MatchingEngine:
         self.interaction_graph = InteractionGraph()
         self.als_model = ALSModel()
         self.engagement_model = EngagementScorer()
+        self.recommender = None  # Initialized after run_popularity()
         self.interaction_df = None
         self.user_df = None
 
@@ -112,14 +114,54 @@ class MatchingEngine:
         self.user_df = self.user_df.merge(like_stats, on='user_id', how='left')
 
         # Assign balanced leagues by gender using PageRank
+        # Only assign leagues to users who are in the ALS model (have sufficient interactions)
         try:
-            leagues = assign_balanced_leagues(self.user_df, pagerank_col='pagerank', gender_col='gender')
-            self.user_df = self.user_df.merge(leagues, on='user_id', how='left')
+            # Get ALL users that appear in ANY ALS model
+            male_ids_in_als = set(self.als_model.male_map.keys()) | set(self.als_model.male_map_f2m.keys())
+            female_ids_in_als = set(self.als_model.female_map.keys()) | set(self.als_model.female_map_f2m.keys())
+            als_user_ids = male_ids_in_als | female_ids_in_als
+            
+            # Filter to only ALS users for league assignment
+            als_users_df = self.user_df[self.user_df['user_id'].isin(als_user_ids)]
+            
+            if len(als_users_df) > 0:
+                leagues = assign_balanced_leagues(als_users_df, pagerank_col='pagerank', gender_col='gender')
+                self.user_df = self.user_df.merge(leagues[['user_id', 'league']], on='user_id', how='left')
+            else:
+                print("⚠️ No users in ALS model for league assignment")
         except Exception as e:
             # Don't fail the pipeline if leagues can't be assigned; just log
             print(f"⚠️ League assignment skipped: {e}")
 
         print("User DF updated ✅")
+    
+    def build_recommender(self, use_gpu: bool = True):
+        """
+        Build FAISS-based league-filtered recommender.
+        
+        Must be called after run_popularity() to ensure leagues are assigned.
+        
+        Args:
+            use_gpu: Whether to use GPU for FAISS indices (default True)
+        """
+        if not self.is_ready():
+            raise ValueError("Data not loaded. Call load_interactions() first.")
+        
+        if 'league' not in self.user_df.columns:
+            raise ValueError("Leagues not assigned. Call run_popularity() first.")
+        
+        try:
+            print("Building FAISS recommender... ", end="")
+            self.recommender = LeagueFilteredRecommender(
+                als_model=self.als_model,
+                user_df=self.user_df,
+                use_gpu=use_gpu
+            )
+            print("✅")
+        except Exception as e:
+            print(f"⚠️ FAISS recommender initialization failed: {e}")
+            self.recommender = None
+            raise
 
     def run_engagement(self, config: EngagementConfig | None = None) -> pd.DataFrame:
         """Compute engagement scores and merge them into the user feature table."""
@@ -153,3 +195,58 @@ class MatchingEngine:
     def get_user_interactions(self, user_id: int, as_decider: bool = True):
         """Get all interactions for a specific user."""
         return self.data_loader.get_user_interactions(user_id, as_decider)
+    
+    def recommend_for_user(self, user_id: int, k: int = 1000) -> List[Tuple[int, float]]:
+        """
+        Get top-k recommendations for a user, filtered by league and ranked by mutual score.
+        
+        Args:
+            user_id: User ID to generate recommendations for
+            k: Number of recommendations to return (default 1000)
+            
+        Returns:
+            List of (candidate_id, mutual_score) tuples, sorted by score descending
+        """
+        if self.recommender is None:
+            raise ValueError("Recommender not initialized. Call run_popularity() first.")
+        
+        # Get user metadata
+        user_row = self.user_df[self.user_df['user_id'] == user_id]
+        if len(user_row) == 0:
+            return []
+        
+        gender = user_row['gender'].iloc[0]
+        league = user_row['league'].iloc[0]
+        
+        if gender == 'M':
+            return self.recommender.recommend_for_male(user_id, league, k)
+        elif gender == 'F':
+            return self.recommender.recommend_for_female(user_id, league, k)
+        else:
+            return []
+    
+    def recommend_batch(self, user_ids: List[int], k: int = 1000) -> Dict[int, List[Tuple[int, float]]]:
+        """
+        Get top-k recommendations for multiple users in batch.
+        
+        Args:
+            user_ids: List of user IDs
+            k: Number of recommendations per user
+            
+        Returns:
+            Dict mapping user_id -> [(candidate_id, mutual_score), ...]
+        """
+        if self.recommender is None:
+            raise ValueError("Recommender not initialized. Call run_popularity() first.")
+        
+        # Build metadata dict
+        user_metadata = {}
+        for uid in user_ids:
+            user_row = self.user_df[self.user_df['user_id'] == uid]
+            if len(user_row) > 0:
+                user_metadata[uid] = {
+                    'gender': user_row['gender'].iloc[0],
+                    'league': user_row['league'].iloc[0]
+                }
+        
+        return self.recommender.recommend_batch(user_ids, user_metadata, k)

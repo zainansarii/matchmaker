@@ -6,6 +6,7 @@ channels:
   - rapidsai
   - conda-forge
   - nvidia
+  - pytorch
 dependencies:
   - python=3.10
   # RAPIDS with CUDA 12.x support (matches official guide)
@@ -17,6 +18,8 @@ dependencies:
   - jupyterlab
   - implicit
   - plotly
+  # FAISS for scalable ANN search (CUDA 12 compatible)
+  - pytorch::faiss-gpu=1.11.0=*cuda12*
   - pip
   - pip:
       - -e . # Installs the local 'matchmaker' project in editable mode

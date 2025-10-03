@@ -365,7 +365,14 @@ def assign_balanced_leagues(
     labels = ("Bronze", "Silver", "Gold", "Platinum", "Diamond"),
 ) -> cudf.DataFrame:
     """
-    Assign league tiers based on PageRank, preserving gender proportions within each tier.
+    Assign league tiers based on PageRank, using gender-stratified ranking.
+    
+    This assigns leagues separately per gender to ensure each gender gets a balanced
+    30/20/20/20/10 distribution. This preserves the global gender ratio in each league
+    (e.g., if users are 80% M / 20% F globally, each league will also be 80% M / 20% F).
+    
+    This approach is necessary when PageRank is gender-biased (e.g., males concentrated
+    at low scores due to asymmetric engagement patterns in dating apps).
 
     Expects user_df to contain columns: 'user_id', pagerank_col, gender_col.
     Returns a cudf.DataFrame with columns ['user_id', 'league'] suitable for merging.
@@ -380,38 +387,39 @@ def assign_balanced_leagues(
     if len(df) == 0:
         return cudf.DataFrame({'user_id': [], 'league': []})
 
-    # Convert minimal frame to pandas for qcut; this is small (~users only)
-    import pandas as pd  # local import to avoid global dependency
+    # Convert to pandas for rank-based assignment
+    import pandas as pd
+    import numpy as np
     pdf = df.to_pandas()
 
     parts = []
     for g in pdf[gender_col].dropna().unique().tolist():
         sub = pdf[pdf[gender_col] == g].copy()
-        if len(sub) < 2:
-            # Not enough records to form bins
+        if len(sub) < len(labels):
+            # Not enough records to form all bins - assign everyone to Bronze
             sub['league'] = labels[0]
             parts.append(sub[['user_id', 'league']])
             continue
 
         try:
-            # First, compute quantile-based bins without labels so pandas decides actual bin edges
-            cats = pd.qcut(
-                sub[pagerank_col],
-                q=quantiles,
-                labels=None,
-                duplicates='drop'
-            )
-
-            # Determine actual number of bins created (can be fewer due to duplicate edges)
-            num_bins = len(cats.cat.categories)
-            if num_bins <= 0:
-                sub['league'] = labels[0]
-            else:
-                # Slice labels to the exact number of bins and rename categories accordingly
-                sliced_labels = list(labels)[:num_bins]
-                sub['league'] = cats.cat.rename_categories(sliced_labels)
-        except Exception:
-            # Fallback: assign everyone to base tier for this gender on any unexpected error
+            # Use rank-based quantiles to handle duplicate PageRank values
+            # Sort by PageRank and assign leagues based on rank position within this gender
+            sub = sub.sort_values(pagerank_col).reset_index(drop=True)
+            n = len(sub)
+            
+            # Define cutoff indices for each league (30/20/20/20/10 split)
+            cutoffs = [int(n * q) for q in [0.3, 0.5, 0.7, 0.9]]
+            
+            # Assign leagues based on position within gender
+            sub['league'] = labels[0]  # Default to Bronze (bottom 30%)
+            sub.loc[sub.index >= cutoffs[0], 'league'] = labels[1]  # Silver (30-50%)
+            sub.loc[sub.index >= cutoffs[1], 'league'] = labels[2]  # Gold (50-70%)
+            sub.loc[sub.index >= cutoffs[2], 'league'] = labels[3]  # Platinum (70-90%)
+            sub.loc[sub.index >= cutoffs[3], 'league'] = labels[4]  # Diamond (top 10%)
+            
+        except Exception as e:
+            # Fallback: assign everyone to Bronze for this gender on any error
+            print(f"Warning: League assignment failed for gender {g}: {e}")
             sub['league'] = labels[0]
 
         parts.append(sub[['user_id', 'league']])
@@ -422,6 +430,3 @@ def assign_balanced_leagues(
     result_pdf = pd.concat(parts, axis=0, ignore_index=True)
     result_cudf = cudf.from_pandas(result_pdf[['user_id', 'league']])
     return result_cudf
-
-
-
