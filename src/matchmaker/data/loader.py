@@ -3,7 +3,6 @@ Data loading and preprocessing for the matchmaker library.
 """
 
 import cudf
-import cugraph
 from typing import Optional
 
 
@@ -41,7 +40,7 @@ class DataLoader:
             'data_path': data_path
         }
         
-        # Load and preprocess data
+                # Load and preprocess data
         raw_df = cudf.read_csv(data_path)
         self._interaction_df = self._preprocess_interactions(
             raw_df, decider_col, other_col, like_col, timestamp_col, gender_col

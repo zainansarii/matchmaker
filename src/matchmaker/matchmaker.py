@@ -57,28 +57,22 @@ class MatchingEngine:
 
             print("Fitting ALS... ", end="")
             self.als_model.fit(
-                self.interaction_df, 
-                decider_col, 
-                other_col, 
-                like_col
-            )            
+                self.interaction_df,
+                self.user_df,
+                decider_col,
+                other_col,
+                like_col,
+                gender_col="gender"
+            )         
             print("Complete! ✅")
-            
-        except ValueError:
-            # ValueError is raised by our validation - just show the custom message without traceback
-            print(f"❌ Error loading data")
-            print("Please ensure your CSV has the required columns with correct data types:")
-            print(f"- {decider_col}: numeric (user ID)")
-            print(f"- {other_col}: numeric (user ID)")
-            print(f"- {like_col}: numeric (0/1 values)")
-            print(f"- {timestamp_col}: valid datetime format")
-            return
-        
+
         except Exception as e:
             print(f"❌ Error loading data: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return
 
-    def run_popularity(self) -> pd.DataFrame:
+    def run_popularity(self):
         """
         Computes popularity-based features for users.
         

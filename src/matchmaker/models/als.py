@@ -1,470 +1,230 @@
 import numpy as np
-import pandas as pd
 import cupy as cp
+import cudf
 from scipy import sparse as sp
 from implicit.als import AlternatingLeastSquares
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
+
 
 class ALSModel:
-    """
-    GPU-accelerated collaborative filtering for dating app recommendations.
-    Uses Implicit ALS with square user-user matrix structure.
-    """
-    
-    def __init__(self, 
-                 factors=64,           
-                 regularization=0.01,  
-                 iterations=15,        
-                 alpha=40.0,          
-                 use_gpu=True,
-                 random_state=42):
-        """
-        Initialize the collaborative filtering model.
+    def __init__(self, factors=64, regularization=0.01, alpha=1.0, iterations=15):
         
-        Args:
-            factors: Number of latent factors
-            regularization: L2 regularization strength
-            iterations: Number of ALS iterations
-            alpha: Confidence weighting for implicit feedback
-            use_gpu: Whether to use GPU acceleration
-            random_state: Random seed for reproducibility
-        """
-        self.factors = factors
-        self.regularization = regularization
-        self.iterations = iterations
         self.alpha = alpha
-        self.random_state = random_state
-        
-        # Check GPU availability
-        self.use_gpu = use_gpu and self._check_gpu_available()
-        
-        self.model = AlternatingLeastSquares(
-            factors=factors,
-            regularization=regularization,
-            iterations=iterations,
-            use_gpu=self.use_gpu,
-            random_state=random_state,
-            dtype=np.float32
+        self.model_m2f = AlternatingLeastSquares(
+            factors=factors, regularization=regularization, iterations=iterations
         )
-        
-        # Mappings and matrices
-        self.user2idx = None
-        self.idx2user = None
-        self.user_user_matrix = None
-        
-        # Cache for performance
-        self.user_factors = None
-        self.item_factors = None
-        
-        # Stats
-        self.n_users = 0
-        self.n_interactions = 0
-        
-    def _check_gpu_available(self):
-        """Check if GPU is available for computation"""
-        try:
-            test = cp.array([1, 2, 3])
-            del test
-            print("✅ GPU acceleration enabled")
-            return True
-        except:
-            print("⚠️ GPU not available, falling back to CPU")
-            return False
-    
-    def _convert_factors_to_numpy(self, factors):
-        """Convert implicit factors to numpy arrays, handling both CPU and GPU matrices"""
-        try:
-            # Method 1: Use .to_numpy() if available (for implicit GPU matrices)
-            if hasattr(factors, 'to_numpy'):
-                return factors.to_numpy()
-            # Method 2: Use cupy.asnumpy() for CuPy arrays
-            elif hasattr(factors, 'get'):
-                return factors.get()
-            # Method 3: Direct numpy conversion
-            else:
-                return np.array(factors)
-        except Exception as e:
-            print(f"Warning: Factor conversion failed with {type(factors)}: {e}")
-            # Fallback - return the original factors (may cause issues)
-            return factors
-    
-    def fit(self, interactions, 
-            user_col,
-            target_col, 
-            value_col,
-            min_interactions=2):
-        """
-        Fit the collaborative filtering model on interaction data.
-        
-        Args:
-            interactions: DataFrame with user interactions (can be pandas or cudf)
-            user_col: Column name for users making decisions
-            target_col: Column name for target users
-            value_col: Column name for interaction values (0/1)
-            min_interactions: Minimum interactions required per user
-        """
-        print("🚀 Starting collaborative filtering training...")
-        total_start = pd.Timestamp.now()
-        
-        # Handle both pandas and cudf DataFrames
-        if hasattr(interactions, 'to_pandas'):
-            # It's a cuDF DataFrame
-            print("📊 Detected cuDF DataFrame, converting to pandas...")
-            df = interactions[[user_col, target_col, value_col]].to_pandas()
-        else:
-            # It's a pandas DataFrame
-            df = interactions[[user_col, target_col, value_col]].copy()
-        
-        # Filter out users with too few interactions
-        user_counts = df.groupby(user_col)[value_col].count().reset_index()
-        user_counts.columns = [user_col, 'count']
-        active_users = user_counts[user_counts['count'] >= min_interactions][user_col]
-        
-        # Filter interactions
-        df = df[df[user_col].isin(active_users)]
-        
-        # Create user mappings - get all unique users from both columns
-        print("📊 Creating user mappings...")
-        all_users = set(df[user_col].unique()) | set(df[target_col].unique())
-        # Filter to only include active users
-        all_users = list(all_users.intersection(set(active_users)))
-        
-        self.n_users = len(all_users)
-        
-        # Create mappings
-        self.user2idx = {user: idx for idx, user in enumerate(all_users)}
-        self.idx2user = {idx: user for user, idx in self.user2idx.items()}
-        
-        print(f"📈 {self.n_users:,} users in square matrix")
-        
-        # Map to indices
-        df['user_idx'] = df[user_col].map(self.user2idx)
-        df['target_idx'] = df[target_col].map(self.user2idx)
-        
-        # Remove unmapped entries (users not in active list)
-        df = df.dropna(subset=['user_idx', 'target_idx'])
-        df['user_idx'] = df['user_idx'].astype(np.int32)
-        df['target_idx'] = df['target_idx'].astype(np.int32)
-        
-        # Apply confidence weighting (implicit feedback)
-        df['confidence'] = 1 + self.alpha * df[value_col].astype(np.float32)
-        
-        # Remove duplicates by taking max confidence
-        df = df.groupby(['user_idx', 'target_idx'])['confidence'].max().reset_index()
-        
-        self.n_interactions = len(df)
-        print(f"💾 {self.n_interactions:,} unique interactions")
-        
-        # Build square sparse matrix (user x user)
-        print("🔨 Building square sparse matrix...")
-        
-        self.user_user_matrix = sp.csr_matrix(
-            (df['confidence'].values, 
-             (df['user_idx'].values, df['target_idx'].values)),
-            shape=(self.n_users, self.n_users),
-            dtype=np.float32
+        self.model_f2m = AlternatingLeastSquares(
+            factors=factors, regularization=regularization, iterations=iterations
         )
+
+        # mappings
+        self.male_map, self.female_map = {}, {}
+        self.rev_male_map, self.rev_female_map = {}, {}
+
+    # ---------------------- Data Preparation ---------------------- #
+    def _join_with_genders(self, interactions, users, decider_col, other_col, gender_col):
+        """Join interactions with genders for both decider and other users."""
+        df = interactions.merge(
+            users.rename(columns={"user_id": decider_col, gender_col: "decider_gender"}),
+            on=decider_col,
+            how="inner",
+        )
+        df = df.merge(
+            users.rename(columns={"user_id": other_col, gender_col: "other_gender"}),
+            on=other_col,
+            how="inner",
+        )
+        return df
+
+    def _filter_active_users(self, df, user_col, min_interactions):
+        """Filter users with at least min_interactions."""
+        if len(df) == 0:
+            raise ValueError(f"No interactions found after gender filtering. Check data for heterosexual pairs.")
+        counts = df.groupby(user_col).size().reset_index(name="count")
+        active_users = counts[counts["count"] >= min_interactions][user_col]
+        filtered_df = df.merge(active_users.to_frame(), on=user_col, how="inner")
+        if len(filtered_df) == 0:
+            raise ValueError(f"No users with at least {min_interactions} interactions after filtering.")
+        return filtered_df
+
+    # ---------------------- Matrix Builders ---------------------- #
+    def _build_matrix(self, df, row_col, col_col, like_col):
+        """Build sparse CSR matrix from interaction df, using only positive interactions."""
+        # Filter to only positive interactions (likes=1)
+        # Implicit ALS treats unobserved as negative, so we only include positives
+        df_pos = df[df[like_col] > 0].copy()
         
-        density = 100.0 * self.n_interactions / (self.n_users * self.n_users)
-        print(f"📊 Matrix density: {density:.4f}%")
+        if len(df_pos) == 0:
+            raise ValueError("No positive interactions (likes) found after filtering.")
         
-        # Fit the model - for ALS, we need to transpose for item-user format
-        print("🎯 Training ALS model...")
-        fit_start = pd.Timestamp.now()
+        # Get unique IDs in the same order as they appear
+        row_ids = df_pos[row_col].unique().to_pandas().tolist()
+        col_ids = df_pos[col_col].unique().to_pandas().tolist()
+
+        if not row_ids or not col_ids:
+            raise ValueError("No unique row or column IDs found in positive interactions.")
+
+        row_map = {uid: i for i, uid in enumerate(row_ids)}
+        col_map = {uid: i for i, uid in enumerate(col_ids)}
+        rev_row_map = {i: uid for uid, i in row_map.items()}
+        rev_col_map = {i: uid for uid, i in col_map.items()}
+
+        rows = df_pos[row_col].map(row_map).to_pandas().values
+        cols = df_pos[col_col].map(col_map).to_pandas().values
+        # For positive-only matrix, confidence is just alpha-weighted count
+        vals = (1 + self.alpha * df_pos[like_col].astype("float32")).to_pandas().values
+
+        # Use numpy directly since values are already numpy arrays
+        mat = sp.csr_matrix(
+            (vals, (rows, cols)),
+            shape=(len(row_map), len(col_map)),
+        )
+        return mat, row_map, col_map, rev_row_map, rev_col_map
+
+    # ---------------------- Training ---------------------- #
+    def fit(
+        self,
+        interactions: cudf.DataFrame,
+        users: cudf.DataFrame,
+        decider_col: str,
+        other_col: str,
+        like_col: str,
+        gender_col: str,
+        min_interactions: int = 2,
+    ):
+        """
+        Train ALS on heterosexual matches and cache factors as CuPy arrays.
+        """
+        print("🚀 Preparing data...")
+        df = self._join_with_genders(interactions, users, decider_col, other_col, gender_col)
+
+        # --- Male → Female --- #
+        m2f = df[(df.decider_gender == "M") & (df.other_gender == "F")].copy()
+        m2f = self._filter_active_users(m2f, decider_col, min_interactions)
+
+        self.M2F, self.male_map, self.female_map, self.rev_male_map, self.rev_female_map = \
+            self._build_matrix(m2f, decider_col, other_col, like_col)
+
+        # --- Female → Male --- #
+        f2m = df[(df.decider_gender == "F") & (df.other_gender == "M")].copy()
+        f2m = self._filter_active_users(f2m, decider_col, min_interactions)
+        self.F2M, self.female_map_f2m, self.male_map_f2m, self.rev_female_map_f2m, self.rev_male_map_f2m = \
+            self._build_matrix(f2m, decider_col, other_col, like_col)
+
+        # --- Train models --- #
+        print("🎯 Training male→female ALS...")
+        self.model_m2f.fit(self.M2F)
+
+        print("🎯 Training female→male ALS...")
+        self.model_f2m.fit(self.F2M)
+
+        # Cache factors as CuPy arrays for efficient GPU scoring
+        # Convert from implicit's format to numpy first, then to CuPy
+        print("🔄 Converting factors to CuPy arrays...")
         
-        self.model.fit(self.user_user_matrix.T.tocsr(), show_progress=True)
+        # Get factors - implicit returns them as properties
+        m2f_user = self.model_m2f.user_factors
+        m2f_item = self.model_m2f.item_factors
+        f2m_user = self.model_f2m.user_factors
+        f2m_item = self.model_f2m.item_factors
         
-        fit_time = (pd.Timestamp.now() - fit_start).total_seconds()
-        total_time = (pd.Timestamp.now() - total_start).total_seconds()
+        # Convert to numpy arrays if needed (implicit may return different types)
+        if hasattr(m2f_user, 'to_numpy'):
+            m2f_user = m2f_user.to_numpy()
+        if hasattr(m2f_item, 'to_numpy'):
+            m2f_item = m2f_item.to_numpy()
+        if hasattr(f2m_user, 'to_numpy'):
+            f2m_user = f2m_user.to_numpy()
+        if hasattr(f2m_item, 'to_numpy'):
+            f2m_item = f2m_item.to_numpy()
         
-        # Cache factors for faster recommendations - convert to numpy properly
-        print("🔄 Converting factors to numpy arrays...")
-        self.user_factors = self._convert_factors_to_numpy(self.model.user_factors)
-        self.item_factors = self._convert_factors_to_numpy(self.model.item_factors)
-        
-        print(f"✅ Model trained in {fit_time:.2f}s")
-        print(f"⏱️ Total processing time: {total_time:.2f}s")
-        print(f"📋 Factor arrays: user_factors {self.user_factors.shape}, item_factors {self.item_factors.shape}")
-        
+        # Now convert to CuPy (ensure they're numpy arrays first)
+        self.male_factors = cp.asarray(np.asarray(m2f_user, dtype=np.float32))
+        self.female_factors = cp.asarray(np.asarray(m2f_item, dtype=np.float32))
+        self.female_pref_factors = cp.asarray(np.asarray(f2m_user, dtype=np.float32))
+        self.male_attr_factors = cp.asarray(np.asarray(f2m_item, dtype=np.float32))
+
+        print(f"✅ Trained M2F ALS with {self.M2F.shape[0]} males × {self.M2F.shape[1]} females")
+        print(f"✅ Trained F2M ALS with {self.F2M.shape[0]} females × {self.F2M.shape[1]} males")
         return self
-    
-    def recommend_for_user(self, user_id, N=10, filter_already_liked=True, return_scores=True):
-        """
-        Get top N recommendations for a specific user.
+
+    # ---------------------- Scoring & Recs ---------------------- #
+    def mutual_score(self, male_id, female_id):
+        """Calculate bidirectional mutual attraction score between a male and female user."""
+        # Convert to int if needed for lookup
+        male_id = int(male_id) if not isinstance(male_id, int) else male_id
+        female_id = int(female_id) if not isinstance(female_id, int) else female_id
         
-        Args:
-            user_id: User ID to get recommendations for
-            N: Number of recommendations
-            filter_already_liked: Whether to filter out already liked users
-            return_scores: Whether to return scores with recommendations
+        score_total = 0.0
         
-        Returns:
-            List of (user_id, score) tuples or just user_ids
-        """
-        if user_id not in self.user2idx:
-            print(f"⚠️ User {user_id} not found in training data")
+        # M2F score: how much does the male like this female?
+        if male_id in self.male_map and female_id in self.female_map:
+            m_idx = self.male_map[male_id]
+            f_idx = self.female_map[female_id]
+            score_m2f = float(cp.dot(self.male_factors[m_idx], self.female_factors[f_idx]))
+            score_total += score_m2f
+        
+        # F2M score: how much does the female like this male?
+        if female_id in self.female_map_f2m and male_id in self.male_map_f2m:
+            f_idx = self.female_map_f2m[female_id]
+            m_idx = self.male_map_f2m[male_id]
+            score_f2m = float(cp.dot(self.female_pref_factors[f_idx], self.male_attr_factors[m_idx]))
+            score_total += score_f2m
+        
+        # Return None only if we have no information at all
+        if score_total == 0.0:
+            # Check if we had any valid indices
+            has_m2f = male_id in self.male_map and female_id in self.female_map
+            has_f2m = female_id in self.female_map_f2m and male_id in self.male_map_f2m
+            if not has_m2f and not has_f2m:
+                return None
+        
+        return score_total
+
+    def recommend_for_user(self, male_id, N=10, filter_seen=True):
+        """Recommend women for a given man, ranked by mutual score (GPU)."""
+        # Convert to int if needed for lookup
+        male_id = int(male_id) if not isinstance(male_id, int) else male_id
+        
+        if male_id not in self.male_map:
             return []
+
+        m_idx = self.male_map[male_id]
+
+        # Get recommendations from the M2F model
+        # Pass the user's row from the interaction matrix
+        recs = self.model_m2f.recommend(
+            m_idx,
+            self.M2F[m_idx],  # Pass just this user's row
+            N=5 * N,
+            filter_already_liked_items=filter_seen,
+        )
+
+        # recs is a tuple of (item_ids, scores) arrays
+        item_ids, _ = recs
         
-        user_idx = self.user2idx[user_id]
+        # Calculate mutual scores and filter out None values
+        scored = []
+        for f_idx in item_ids:
+            female_id = self.rev_female_map[f_idx]
+            score = self.mutual_score(male_id, female_id)
+            if score is not None:
+                scored.append((female_id, score))
         
-        # Extract the user's row from the matrix
-        user_items = self.user_user_matrix[user_idx]
-        
-        # Get recommendations using correct method signature
-        try:
-            recommendations, scores = self.model.recommend(
-                user_idx,
-                user_items,
-                N=N,
-                recalculate_user=False
-            )
-        except TypeError:
-            # Fallback for different implicit versions
-            recommendations, scores = self.model.recommend(
-                user_idx,
-                user_items,
-                N=N
-            )
-        
-        # Manual filtering of already liked items if requested
-        if filter_already_liked:
-            already_liked = set(user_items.indices[user_items.data > 1])
-            
-            filtered_results = []
-            for target_idx, score in zip(recommendations, scores):
-                if int(target_idx) not in already_liked:
-                    filtered_results.append((target_idx, score))
-            
-            # Take only the top N after filtering
-            filtered_results = filtered_results[:N]
-            recommendations = [r[0] for r in filtered_results]
-            scores = [r[1] for r in filtered_results]
-        
-        # Map back to user IDs
-        results = []
-        for target_idx, score in zip(recommendations, scores):
-            target_id = self.idx2user.get(int(target_idx))
-            if target_id is not None:
-                if return_scores:
-                    results.append((target_id, float(score)))
-                else:
-                    results.append(target_id)
-        
-        return results
-    
-    def recommend_batch(self, user_ids, N=10, filter_already_liked=True, batch_size=1000):
-        """
-        Ultra-optimized batch recommendations using matrix operations with memory management.
-        
-        This version processes users in batches to avoid memory issues while still
-        being much faster than individual processing.
-        
-        Args:
-            user_ids: List of user IDs
-            N: Number of recommendations per user
-            filter_already_liked: Whether to filter out already liked users
-            batch_size: Number of users to process at once (controls memory usage)
-        
-        Returns:
-            Dictionary mapping user_id to list of recommendations
-        """
-        results = {}
-        
-        # Filter valid users
-        valid_users = [uid for uid in user_ids if uid in self.user2idx]
-        if not valid_users:
-            return results
-        
-        print(f"🚀 Processing {len(valid_users)} users in batches of {batch_size}")
-        
-        # Process in batches
-        for batch_start in tqdm(range(0, len(valid_users), batch_size)):
-            batch_end = min(batch_start + batch_size, len(valid_users))
-            batch_users = valid_users[batch_start:batch_end]
-            
-            try:
-                # Convert to indices for this batch
-                user_indices = np.array([self.user2idx[uid] for uid in batch_users])
-                
-                # Get user factors for this batch
-                user_factors_batch = self.user_factors[user_indices]  # Shape: (batch_size, n_factors)
-                
-                # Compute scores for all users in batch against all items
-                batch_scores = np.dot(user_factors_batch, self.item_factors.T)  # Shape: (batch_size, n_users)
-                
-                # Process each user's scores in this batch
-                for i, uid in enumerate(batch_users):
-                    user_idx = user_indices[i]
-                    user_scores = batch_scores[i].copy()  # Copy to avoid modifying original
-                    
-                    # Apply filtering if requested
-                    if filter_already_liked:
-                        user_items = self.user_user_matrix[user_idx]
-                        already_liked = user_items.indices[user_items.data > 1]
-                        user_scores[already_liked] = -np.inf  # Mask out already liked items
-                    
-                    # Also mask out the user themselves
-                    user_scores[user_idx] = -np.inf
-                    
-                    # Get top N recommendations efficiently
-                    if len(user_scores) > N:
-                        # Use argpartition for better performance when N << total_users
-                        top_indices = np.argpartition(user_scores, -N)[-N:]
-                        top_indices = top_indices[np.argsort(user_scores[top_indices])][::-1]
-                    else:
-                        # If we have fewer items than N, just sort all
-                        top_indices = np.argsort(user_scores)[::-1]
-                    
-                    # Convert to user IDs and scores
-                    user_results = []
-                    for idx in top_indices:
-                        if user_scores[idx] > -np.inf:  # Valid recommendation
-                            target_id = self.idx2user.get(int(idx))
-                            if target_id is not None:
-                                user_results.append((target_id, float(user_scores[idx])))
-                        if len(user_results) >= N:  # Stop once we have enough
-                            break
-                    
-                    results[uid] = user_results
-                    
-            except Exception as e:
-                print(f"⚠️ Batch processing failed for batch {batch_start//batch_size + 1} ({e})")
-                print("🔄 Falling back to individual processing for this batch...")
-                
-                # Fallback to individual processing for this batch only
-                for uid in batch_users:
-                    try:
-                        results[uid] = self.recommend_for_user(uid, N, filter_already_liked)
-                    except Exception as individual_error:
-                        print(f"⚠️ Individual processing failed for user {uid}: {individual_error}")
-                        results[uid] = []
-        
-        print(f"✅ Completed batch processing for {len(results)} users")
-        return results
-    
-    def find_similar_users(self, user_id, N=10):
-        """
-        Find users with similar preferences.
-        
-        Args:
-            user_id: User ID to find similar users for
-            N: Number of similar users to return
-        
-        Returns:
-            List of (user_id, similarity_score) tuples
-        """
-        if user_id not in self.user2idx:
-            return []
-        
-        user_idx = self.user2idx[user_id]
-        
-        # Use numpy arrays for consistent computation
-        user_vector = self.user_factors[user_idx]
-        all_factors = self.user_factors
-        
-        # Compute similarities with all other users - CPU version for consistency
-        try:
-            norms = np.linalg.norm(all_factors, axis=1)
-            user_norm = np.linalg.norm(user_vector)
-            similarities = np.dot(all_factors, user_vector) / (norms * user_norm + 1e-8)
-        except Exception as e:
-            print(f"Error computing similarities: {e}")
-            return []
-        
-        # Get top N similar users (excluding self)
-        similarities[user_idx] = -1  # Exclude self
-        top_indices = np.argsort(similarities)[-N-1:-1][::-1]
-        
-        results = []
-        for idx in top_indices:
-            if idx != user_idx and similarities[idx] > 0:
-                similar_user_id = self.idx2user.get(int(idx))
-                if similar_user_id:
-                    results.append((similar_user_id, float(similarities[idx])))
-        
-        return results[:N]
-    
-    def explain_recommendation(self, user_id, recommended_user_id, N=5):
-        """
-        Explain why a user was recommended to another user.
-        
-        Args:
-            user_id: User ID
-            recommended_user_id: Recommended user ID
-            N: Number of similar users to show as explanation
-        
-        Returns:
-            Dictionary with explanation details
-        """
-        if user_id not in self.user2idx or recommended_user_id not in self.user2idx:
-            return None
-        
-        user_idx = self.user2idx[user_id]
-        rec_user_idx = self.user2idx[recommended_user_id]
-        
-        # Get users who liked the recommended user
-        rec_user_col = self.user_user_matrix[:, rec_user_idx].tocoo()
-        users_who_liked = [(self.idx2user[idx], float(data)) 
-                          for idx, data in zip(rec_user_col.row, rec_user_col.data) 
-                          if data > 1 and idx in self.idx2user]
-        
-        # Find similar users among those who liked
-        similar_users = self.find_similar_users(user_id, N=50)
-        similar_who_liked = []
-        
-        for similar_user, similarity in similar_users:
-            if any(u[0] == similar_user for u in users_who_liked):
-                similar_who_liked.append((similar_user, similarity))
-                if len(similar_who_liked) >= N:
-                    break
-        
-        # Calculate predicted score using numpy arrays
-        user_vector = self.user_factors[user_idx]
-        rec_user_vector = self.item_factors[rec_user_idx]
-        predicted_score = float(np.dot(user_vector, rec_user_vector))
-        
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:N]
+
+    def recommend_batch(self, male_ids, N=10, filter_seen=True):
+        """Batch recommend: {male_id: [(female_id, score), ...]} on GPU"""
+        # Convert all IDs to int for consistency
+        male_ids = [int(mid) if not isinstance(mid, int) else mid for mid in male_ids]
+        return {mid: self.recommend_for_user(mid, N=N, filter_seen=filter_seen) for mid in male_ids}
+
+
+    def get_allowed_ids(self):
+        """Return dict with male and female IDs that can be used for recommendations."""
         return {
-            'user_id': user_id,
-            'recommended_user_id': recommended_user_id,
-            'predicted_score': predicted_score,
-            'total_likes': len(users_who_liked),
-            'similar_users_who_liked': similar_who_liked,
-            'explanation': f"Recommended because {len(similar_who_liked)} similar users also liked this profile"
+            'male_ids': list(self.male_map.keys()),
+            'female_ids': list(self.female_map.keys())
         }
-    
-    def save_model(self, filepath):
-        """Save the trained model to disk"""
-        import pickle
-        
-        model_data = {
-            'model_state': self.model,
-            'user2idx': self.user2idx,
-            'idx2user': self.idx2user,
-            'n_users': self.n_users,
-            'n_interactions': self.n_interactions,
-            'user_factors': self.user_factors,
-            'item_factors': self.item_factors
-        }
-        
-        with open(filepath, 'wb') as f:
-            pickle.dump(model_data, f)
-        print(f"✅ Model saved to {filepath}")
-    
-    def load_model(self, filepath):
-        """Load a trained model from disk"""
-        import pickle
-        
-        with open(filepath, 'rb') as f:
-            model_data = pickle.load(f)
-        
-        self.model = model_data['model_state']
-        self.user2idx = model_data['user2idx']
-        self.idx2user = model_data['idx2user']
-        self.n_users = model_data['n_users']
-        self.n_interactions = model_data['n_interactions']
-        self.user_factors = model_data['user_factors']
-        self.item_factors = model_data['item_factors']
-        
-        print(f"✅ Model loaded from {filepath}")
-        return self
