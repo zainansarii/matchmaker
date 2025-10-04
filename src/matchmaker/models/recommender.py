@@ -11,14 +11,7 @@ import cudf
 import pandas as pd
 from typing import Dict, List, Tuple, Optional, Any
 import warnings
-
-try:
-    import faiss
-    FAISS_AVAILABLE = True
-except ImportError as e:
-    FAISS_AVAILABLE = False
-    warnings.warn(f"FAISS not available: {e}. Install with: conda install -c pytorch faiss-gpu")
-    faiss = None  # type: ignore
+import faiss
 
 
 class LeagueFilteredRecommender:
@@ -38,8 +31,6 @@ class LeagueFilteredRecommender:
             user_df: DataFrame with columns [user_id, gender, league]
             use_gpu: Whether to use GPU for FAISS (requires faiss-gpu)
         """
-        if not FAISS_AVAILABLE:
-            raise ImportError("FAISS is required. Install with: conda install -c pytorch faiss-gpu")
         
         self.als_model = als_model
         self.use_gpu = use_gpu and faiss.get_num_gpus() > 0
