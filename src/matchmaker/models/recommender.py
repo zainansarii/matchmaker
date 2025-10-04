@@ -63,9 +63,7 @@ class LeagueFilteredRecommender:
         self.male_id_map = {}   # league -> [user_ids]
         self.female_indices = {}
         self.female_id_map = {}
-        
-        print(f"Building FAISS indices for league-filtered search...")
-        
+                
         # Build indices for each league
         leagues = ['Bronze', 'Silver', 'Gold', 'Platinum', 'Diamond']
         
@@ -95,7 +93,6 @@ class LeagueFilteredRecommender:
                     # Build FAISS index
                     self.male_indices[league] = self._create_index(factors)
                     self.male_id_map[league] = valid_ids
-                    print(f"  {league} males: {len(valid_ids)} users")
             
             # Females in this league  
             league_females = females_df[females_df['league'] == league]
@@ -122,10 +119,7 @@ class LeagueFilteredRecommender:
                     # Build FAISS index
                     self.female_indices[league] = self._create_index(factors)
                     self.female_id_map[league] = valid_ids
-                    print(f"  {league} females: {len(valid_ids)} users")
-        
-        print(f"✅ FAISS indices built for {len(self.male_indices)} male leagues, {len(self.female_indices)} female leagues")
-    
+            
     def _create_index(self, factors: np.ndarray) -> Any:
         """Create FAISS index from factor embeddings."""
         d = factors.shape[1]  # dimensionality

@@ -49,7 +49,7 @@ class MatchingEngine:
             self.user_df = self.data_loader.user_df
             print("✅")
 
-            print("Constructing graph...", end="")
+            print("Constructing graph... ", end="")
             self.interaction_graph.build_graph(
                 self.interaction_df, 
                 decider_col, 
@@ -58,7 +58,7 @@ class MatchingEngine:
             )
             print("✅")
 
-            print("Fitting ALS... ", end="")
+            print("Fitting ALS... ")
             self.als_model.fit(
                 self.interaction_df,
                 self.user_df,
