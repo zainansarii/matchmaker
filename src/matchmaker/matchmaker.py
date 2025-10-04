@@ -1,3 +1,4 @@
+import cudf
 import pandas as pd  # type: ignore[import]
 from typing import Optional, List, Tuple, Dict
 
@@ -239,14 +240,20 @@ class MatchingEngine:
         if self.recommender is None:
             raise ValueError("Recommender not initialized. Call run_popularity() first.")
         
-        # Build metadata dict
-        user_metadata = {}
-        for uid in user_ids:
-            user_row = self.user_df[self.user_df['user_id'] == uid]
-            if len(user_row) > 0:
-                user_metadata[uid] = {
-                    'gender': user_row['gender'].iloc[0],
-                    'league': user_row['league'].iloc[0]
-                }
+        # Build metadata dict with efficient single DataFrame operation
+        user_ids_set = set(user_ids)
+        
+        # Convert to pandas if needed for faster iteration
+        if isinstance(self.user_df, cudf.DataFrame):
+            users_subset = self.user_df[self.user_df['user_id'].isin(user_ids_set)][['user_id', 'gender', 'league']].to_pandas()
+        else:
+            users_subset = self.user_df[self.user_df['user_id'].isin(user_ids_set)][['user_id', 'gender', 'league']]
+        
+        # Build metadata dict from the subset
+        user_metadata = {
+            row['user_id']: {'gender': row['gender'], 'league': row['league']}
+            for _, row in users_subset.iterrows()
+        }
         
         return self.recommender.recommend_batch(user_ids, user_metadata, k)
+

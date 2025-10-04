@@ -3,6 +3,7 @@ import cupy as cp
 import cudf
 from scipy import sparse as sp
 from implicit.als import AlternatingLeastSquares
+from typing import List, Tuple
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -144,10 +145,35 @@ class ALSModel:
         self.female_factors = cp.asarray(np.asarray(m2f_item, dtype=np.float32))
         self.female_pref_factors = cp.asarray(np.asarray(f2m_user, dtype=np.float32))
         self.male_attr_factors = cp.asarray(np.asarray(f2m_item, dtype=np.float32))
+        
+        # Create vectorized lookup arrays for fast batch scoring
+        # Instead of dict lookups in loops, we can use numpy array indexing
+        self._build_vectorized_maps()
 
         print(f"✅ Trained M2F ALS with {self.M2F.shape[0]} males × {self.M2F.shape[1]} females")
         print(f"✅ Trained F2M ALS with {self.F2M.shape[0]} females × {self.F2M.shape[1]} males")
         return self
+    
+    def _build_vectorized_maps(self):
+        """Build vectorized lookup arrays for fast batch scoring."""
+        # Find max IDs to size the arrays
+        max_male_id = max(max(self.male_map.keys()), max(self.male_map_f2m.keys()))
+        max_female_id = max(max(self.female_map.keys()), max(self.female_map_f2m.keys()))
+        
+        # Create lookup arrays: id -> factor_index (use -1 for missing)
+        self.male_map_vec = np.full(max_male_id + 1, -1, dtype=np.int32)
+        self.female_map_vec = np.full(max_female_id + 1, -1, dtype=np.int32)
+        self.male_map_f2m_vec = np.full(max_male_id + 1, -1, dtype=np.int32)
+        self.female_map_f2m_vec = np.full(max_female_id + 1, -1, dtype=np.int32)
+        
+        for user_id, idx in self.male_map.items():
+            self.male_map_vec[user_id] = idx
+        for user_id, idx in self.female_map.items():
+            self.female_map_vec[user_id] = idx
+        for user_id, idx in self.male_map_f2m.items():
+            self.male_map_f2m_vec[user_id] = idx
+        for user_id, idx in self.female_map_f2m.items():
+            self.female_map_f2m_vec[user_id] = idx
 
     # ---------------------- Scoring & Recs ---------------------- #
     def mutual_score(self, male_id, female_id):
@@ -181,6 +207,76 @@ class ALSModel:
                 return None
         
         return score_total
+    
+    def mutual_score_batch(self, pairs: List[Tuple[int, int]]) -> np.ndarray:
+        """
+        Calculate mutual scores for a batch of (male_id, female_id) pairs - VECTORIZED VERSION.
+        
+        Uses vectorized array lookups instead of dict iterations for 10-100x speedup.
+        
+        Args:
+            pairs: List of (male_id, female_id) tuples
+            
+        Returns:
+            numpy array of scores (same length as pairs)
+        """
+        if not pairs:
+            return np.array([])
+        
+        n_pairs = len(pairs)
+        
+        # Convert pairs to numpy arrays
+        pairs_array = np.array(pairs, dtype=np.int32)
+        male_ids = pairs_array[:, 0]
+        female_ids = pairs_array[:, 1]
+        
+        scores_gpu = cp.zeros(n_pairs, dtype=cp.float32)
+        
+        # M2F: Vectorized lookups (no Python loops!)
+        # Clip IDs to valid range for array indexing
+        male_ids_clipped = np.clip(male_ids, 0, len(self.male_map_vec) - 1)
+        female_ids_clipped = np.clip(female_ids, 0, len(self.female_map_vec) - 1)
+        
+        # Vectorized lookup: get factor indices (-1 if not in map)
+        m_factor_idx = self.male_map_vec[male_ids_clipped]
+        f_factor_idx = self.female_map_vec[female_ids_clipped]
+        
+        # Valid pairs are those where both indices >= 0
+        m2f_valid = (m_factor_idx >= 0) & (f_factor_idx >= 0)
+        
+        if m2f_valid.any():
+            valid_m_idx = m_factor_idx[m2f_valid]
+            valid_f_idx = f_factor_idx[m2f_valid]
+            valid_positions = np.where(m2f_valid)[0]
+            
+            # GPU operations
+            m_factors = self.male_factors[valid_m_idx]
+            f_factors = self.female_factors[valid_f_idx]
+            m2f_scores = cp.sum(m_factors * f_factors, axis=1)
+            scores_gpu[valid_positions] += m2f_scores
+        
+        # F2M: Vectorized lookups
+        female_ids_clipped_f2m = np.clip(female_ids, 0, len(self.female_map_f2m_vec) - 1)
+        male_ids_clipped_f2m = np.clip(male_ids, 0, len(self.male_map_f2m_vec) - 1)
+        
+        f_pref_idx = self.female_map_f2m_vec[female_ids_clipped_f2m]
+        m_attr_idx = self.male_map_f2m_vec[male_ids_clipped_f2m]
+        
+        f2m_valid = (f_pref_idx >= 0) & (m_attr_idx >= 0)
+        
+        if f2m_valid.any():
+            valid_f_idx = f_pref_idx[f2m_valid]
+            valid_m_idx = m_attr_idx[f2m_valid]
+            valid_positions = np.where(f2m_valid)[0]
+            
+            # GPU operations
+            f_factors = self.female_pref_factors[valid_f_idx]
+            m_factors = self.male_attr_factors[valid_m_idx]
+            f2m_scores = cp.sum(f_factors * m_factors, axis=1)
+            scores_gpu[valid_positions] += f2m_scores
+        
+        # Single GPU->CPU transfer
+        return scores_gpu.get()
 
     def recommend_for_user(self, male_id, N=10, filter_seen=True):
         """Recommend women for a given man, ranked by mutual score (GPU)."""

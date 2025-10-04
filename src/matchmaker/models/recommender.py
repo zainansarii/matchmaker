@@ -191,17 +191,22 @@ class LeagueFilteredRecommender:
         
         distances, indices = index.search(male_factor.astype('float32'), k_search)
         
-        # Map FAISS indices back to user IDs and compute mutual scores
-        recommendations = []
-        for idx, base_score in zip(indices[0], distances[0]):
+        # Map FAISS indices back to user IDs and compute mutual scores in batch
+        candidate_ids = []
+        for idx in indices[0]:
             if idx == -1:  # FAISS returns -1 for empty results
                 continue
             female_id = self.female_id_map[league][idx]
+            candidate_ids.append(female_id)
+        
+        # Batch compute mutual scores
+        if candidate_ids:
+            pairs = [(male_id, fid) for fid in candidate_ids]
+            mutual_scores = self.als_model.mutual_score_batch(pairs)
             
-            # Compute full mutual score (M2F + F2M if available)
-            mutual_score = self.als_model.mutual_score(male_id, female_id)
-            if mutual_score is not None:
-                recommendations.append((female_id, mutual_score))
+            recommendations = [(fid, float(score)) for fid, score in zip(candidate_ids, mutual_scores) if score > 0]
+        else:
+            recommendations = []
         
         # Sort by mutual score descending
         recommendations.sort(key=lambda x: x[1], reverse=True)
@@ -235,17 +240,22 @@ class LeagueFilteredRecommender:
         
         distances, indices = index.search(female_factor.astype('float32'), k_search)
         
-        # Map FAISS indices back to user IDs and compute mutual scores
-        recommendations = []
-        for idx, base_score in zip(indices[0], distances[0]):
+        # Map FAISS indices back to user IDs and compute mutual scores in batch
+        candidate_ids = []
+        for idx in indices[0]:
             if idx == -1:
                 continue
             male_id = self.male_id_map[league][idx]
+            candidate_ids.append(male_id)
+        
+        # Batch compute mutual scores
+        if candidate_ids:
+            pairs = [(mid, female_id) for mid in candidate_ids]
+            mutual_scores = self.als_model.mutual_score_batch(pairs)
             
-            # Compute full mutual score
-            mutual_score = self.als_model.mutual_score(male_id, female_id)
-            if mutual_score is not None:
-                recommendations.append((male_id, mutual_score))
+            recommendations = [(mid, float(score)) for mid, score in zip(candidate_ids, mutual_scores) if score > 0]
+        else:
+            recommendations = []
         
         # Sort by mutual score descending
         recommendations.sort(key=lambda x: x[1], reverse=True)
@@ -254,7 +264,7 @@ class LeagueFilteredRecommender:
     def recommend_batch(self, user_ids: List[int], user_metadata: Dict[int, Dict[str, str]], 
                        k: int = 1000) -> Dict[int, List[Tuple[int, float]]]:
         """
-        Batch recommend for multiple users.
+        Batch recommend for multiple users with optimized FAISS batch search.
         
         Args:
             user_ids: List of user IDs
@@ -265,6 +275,9 @@ class LeagueFilteredRecommender:
             Dict mapping user_id -> [(candidate_id, mutual_score), ...]
         """
         results = {}
+        
+        # Group users by (gender, league) for batched FAISS queries
+        groups = {}  # (gender, league) -> [user_ids]
         for uid in user_ids:
             if uid not in user_metadata:
                 results[uid] = []
@@ -273,12 +286,145 @@ class LeagueFilteredRecommender:
             meta = user_metadata[uid]
             gender = meta.get('gender')
             league = meta.get('league')
+            key = (gender, league)
             
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(uid)
+        
+        # Process each group with batch FAISS search
+        for (gender, league), group_uids in groups.items():
             if gender == 'M':
-                results[uid] = self.recommend_for_male(uid, league, k)
+                group_results = self._batch_recommend_males(group_uids, league, k)
             elif gender == 'F':
-                results[uid] = self.recommend_for_female(uid, league, k)
+                group_results = self._batch_recommend_females(group_uids, league, k)
             else:
-                results[uid] = []
+                group_results = {uid: [] for uid in group_uids}
+            
+            results.update(group_results)
+        
+        return results
+    
+    def _batch_recommend_males(self, male_ids: List[int], league: str, k: int) -> Dict[int, List[Tuple[int, float]]]:
+        """Batch recommend females for multiple males in the same league."""
+        if league not in self.female_indices:
+            return {mid: [] for mid in male_ids}
+        
+        # Filter to valid males and get their factors
+        valid_pairs = []  # (male_id, factor_array)
+        for mid in male_ids:
+            if mid in self.als_model.male_map:
+                m_idx = self.als_model.male_map[mid]
+                male_factor = self.als_model.male_factors[m_idx].get()
+                valid_pairs.append((mid, male_factor))
+        
+        if not valid_pairs:
+            return {mid: [] for mid in male_ids}
+        
+        # Stack all male factors into a single matrix for batch search
+        male_ids_ordered, factors_list = zip(*valid_pairs)
+        query_matrix = np.vstack(factors_list).astype('float32')
+        
+        # Batch FAISS search - ONE call for all males
+        index = self.female_indices[league]
+        k_search = min(k, len(self.female_id_map[league]))
+        distances, indices = index.search(query_matrix, k_search)
+        
+        # Collect ALL pairs for batch mutual scoring
+        all_pairs = []
+        pair_to_user = []  # Track which user each pair belongs to
+        
+        for i, mid in enumerate(male_ids_ordered):
+            for idx in indices[i]:
+                if idx == -1:
+                    continue
+                female_id = self.female_id_map[league][idx]
+                all_pairs.append((mid, female_id))
+                pair_to_user.append(i)  # Track user index
+        
+        # Single batch mutual score computation for ALL pairs
+        if all_pairs:
+            all_scores = self.als_model.mutual_score_batch(all_pairs)
+            
+            # Group results by user
+            user_recommendations = {mid: [] for mid in male_ids_ordered}
+            for pair_idx, ((mid, fid), score) in enumerate(zip(all_pairs, all_scores)):
+                if score > 0:
+                    user_recommendations[mid].append((fid, float(score)))
+            
+            # Sort each user's recommendations
+            results = {}
+            for mid in male_ids_ordered:
+                recs = user_recommendations[mid]
+                recs.sort(key=lambda x: x[1], reverse=True)
+                results[mid] = recs[:k]
+        else:
+            results = {mid: [] for mid in male_ids_ordered}
+        
+        # Add empty results for invalid males
+        for mid in male_ids:
+            if mid not in results:
+                results[mid] = []
+        
+        return results
+    
+    def _batch_recommend_females(self, female_ids: List[int], league: str, k: int) -> Dict[int, List[Tuple[int, float]]]:
+        """Batch recommend males for multiple females in the same league."""
+        if league not in self.male_indices:
+            return {fid: [] for fid in female_ids}
+        
+        # Filter to valid females and get their factors
+        valid_pairs = []  # (female_id, factor_array)
+        for fid in female_ids:
+            if fid in self.als_model.female_map_f2m:
+                f_idx = self.als_model.female_map_f2m[fid]
+                female_factor = self.als_model.female_pref_factors[f_idx].get()
+                valid_pairs.append((fid, female_factor))
+        
+        if not valid_pairs:
+            return {fid: [] for fid in female_ids}
+        
+        # Stack all female factors into a single matrix for batch search
+        female_ids_ordered, factors_list = zip(*valid_pairs)
+        query_matrix = np.vstack(factors_list).astype('float32')
+        
+        # Batch FAISS search - ONE call for all females
+        index = self.male_indices[league]
+        k_search = min(k, len(self.male_id_map[league]))
+        distances, indices = index.search(query_matrix, k_search)
+        
+        # Collect ALL pairs for batch mutual scoring
+        all_pairs = []
+        
+        for i, fid in enumerate(female_ids_ordered):
+            for idx in indices[i]:
+                if idx == -1:
+                    continue
+                male_id = self.male_id_map[league][idx]
+                all_pairs.append((male_id, fid))
+        
+        # Single batch mutual score computation for ALL pairs
+        if all_pairs:
+            all_scores = self.als_model.mutual_score_batch(all_pairs)
+            
+            # Group results by female user
+            user_recommendations = {fid: [] for fid in female_ids_ordered}
+            for (mid, fid), score in zip(all_pairs, all_scores):
+                if score > 0:
+                    user_recommendations[fid].append((mid, float(score)))
+            
+            # Sort each user's recommendations
+            results = {}
+            for fid in female_ids_ordered:
+                recs = user_recommendations[fid]
+                recs.sort(key=lambda x: x[1], reverse=True)
+                results[fid] = recs[:k]
+        else:
+            results = {fid: [] for fid in female_ids_ordered}
+        
+        # Add empty results for invalid females
+        for fid in female_ids:
+            if fid not in results:
+                results[fid] = []
         
         return results
