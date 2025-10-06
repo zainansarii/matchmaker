@@ -6,7 +6,7 @@ from .data.loader import DataLoader
 from .models.popularity import InteractionGraph, get_like_stats, assign_balanced_leagues
 from .models.als import ALSModel
 from .models.engagement import EngagementScorer, EngagementConfig
-from .models.recommender import LeagueFilteredRecommender
+from .serving.recommender import LeagueFilteredRecommender
 
 
 class MatchingEngine:
