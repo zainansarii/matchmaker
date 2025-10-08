@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence, Any
 
 try:
     import cudf  # type: ignore[import]
@@ -124,9 +124,7 @@ class EloRatingSystem:
         base_cols = [other_col, like_col, gender_col]
         df = interactions[base_cols].dropna(subset=base_cols)
 
-        unique_genders = [
-            g for g in df[gender_col].dropna().unique().to_pandas().tolist()
-        ]
+        unique_genders = df[gender_col].dropna().unique().to_arrow().to_pylist()
 
         results = []
         for target_gender in unique_genders:
@@ -237,3 +235,103 @@ class EloRatingSystem:
             rating_std=std,
             stable_users=int(results['is_stable'].sum())
         )
+
+
+def assign_leagues_from_elo(
+    user_df: cudf.DataFrame,
+    als_model: Any,
+    *,
+    thresholds: Sequence[float] = (0.3, 0.5, 0.7, 0.9),
+    league_labels: Sequence[str] = ("Bronze", "Silver", "Gold", "Platinum", "Diamond"),
+) -> cudf.DataFrame:
+    """Compute league assignments from ELO ratings using gender-specific percentiles.
+
+    Args:
+        user_df: DataFrame containing at least ``user_id``, ``gender``, and ``elo_rating`` columns.
+        als_model: Fitted ALS model providing user ID mappings (used to filter eligible users).
+        thresholds: Cumulative percentile boundaries (per gender) for league splits.
+        league_labels: Ordered league labels; must be exactly one longer than ``thresholds``.
+
+    Returns:
+        cudf.DataFrame with columns ``user_id`` and ``league`` containing assignments for
+        ALS-covered users. Users not present in ALS mappings will be absent from the result.
+    """
+
+    required_cols = {'user_id', 'gender', 'elo_rating'}
+    missing = required_cols - set(user_df.columns)
+    if missing:
+        raise ValueError(f"assign_leagues_from_elo requires columns: {sorted(missing)}")
+
+    if len(league_labels) != len(thresholds) + 1:
+        raise ValueError("league_labels must have exactly one more entry than thresholds")
+
+    male_ids = set(getattr(als_model, 'male_map', {}).keys())
+    male_ids |= set(getattr(als_model, 'male_map_f2m', {}).keys())
+    female_ids = set(getattr(als_model, 'female_map', {}).keys())
+    female_ids |= set(getattr(als_model, 'female_map_f2m', {}).keys())
+    als_user_ids = male_ids | female_ids
+
+    if not als_user_ids:
+        return cudf.DataFrame(
+            {
+                'user_id': cudf.Series([], dtype=user_df['user_id'].dtype),
+                'league': cudf.Series([], dtype='str'),
+            }
+        )
+
+    eligible = user_df[user_df['user_id'].isin(list(als_user_ids))][['user_id', 'gender', 'elo_rating']]
+    eligible = eligible.dropna(subset=['gender', 'elo_rating'])
+
+    if len(eligible) == 0:
+        return cudf.DataFrame(
+            {
+                'user_id': cudf.Series([], dtype=user_df['user_id'].dtype),
+                'league': cudf.Series([], dtype='str'),
+            }
+        )
+
+    labels = [str(label) for label in league_labels]
+    thresholds_cp = cp.asarray(list(thresholds), dtype=cp.float32)
+    label_map = {str(idx): labels[idx] for idx in range(len(labels))}
+
+    unique_genders = eligible['gender'].dropna().unique()
+    gender_values = unique_genders.to_arrow().to_pylist()
+
+    league_frames = []
+    for gender in gender_values:
+        group = eligible[eligible['gender'] == gender]
+        if len(group) == 0:
+            continue
+
+        if len(group) < len(labels):
+            bronze_series = cudf.Series([labels[0]] * len(group), index=group.index)
+            league_frames.append(
+                cudf.DataFrame({
+                    'user_id': group['user_id'],
+                    'league': bronze_series
+                })
+            )
+            continue
+
+        group_sorted = group.sort_values('elo_rating')
+        n = len(group_sorted)
+        ranks = cp.arange(n, dtype=cp.float32) + 1.0
+        pct = ranks / float(n)
+        bucket_indices = cp.searchsorted(thresholds_cp, pct, side='right')
+        bucket_indices = cp.clip(bucket_indices, 0, len(labels) - 1)
+
+        bucket_series = cudf.Series(bucket_indices.astype(cp.int32), index=group_sorted.index)
+        bucket_series = bucket_series.astype('str')
+        league_sorted = bucket_series.replace(label_map)
+        group_sorted = group_sorted.assign(league=league_sorted)
+        league_frames.append(group_sorted[['user_id', 'league']].sort_index())
+
+    if not league_frames:
+        return cudf.DataFrame(
+            {
+                'user_id': cudf.Series([], dtype=user_df['user_id'].dtype),
+                'league': cudf.Series([], dtype='str'),
+            }
+        )
+
+    return cudf.concat(league_frames, ignore_index=True)

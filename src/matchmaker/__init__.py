@@ -2,16 +2,17 @@
 
 from .engine import MatchingEngine
 from .models.als import ALSModel
-from .models.popularity import InteractionGraph, assign_balanced_leagues
 from .models.engagement import EngagementScorer, EngagementConfig
+from .models.elo import EloRatingSystem, EloConfig, assign_leagues_from_elo
 from .serving.recommender import LeagueFilteredRecommender
 
 __all__ = [
     'MatchingEngine',
     'ALSModel', 
-    'InteractionGraph',
-    'assign_balanced_leagues',
     'EngagementScorer',
     'EngagementConfig',
+    'EloRatingSystem',
+    'EloConfig',
+    'assign_leagues_from_elo',
     'LeagueFilteredRecommender'
 ]

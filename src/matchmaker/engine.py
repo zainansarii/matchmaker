@@ -3,10 +3,9 @@ import pandas as pd  # type: ignore[import]
 from typing import Optional, List, Tuple, Dict
 
 from .data.loader import DataLoader
-from .models.popularity import InteractionGraph, get_like_stats, assign_balanced_leagues
 from .models.als import ALSModel
 from .models.engagement import EngagementScorer, EngagementConfig
-from .models.elo import EloRatingSystem, EloConfig
+from .models.elo import EloRatingSystem, EloConfig, assign_leagues_from_elo
 from .serving.recommender import LeagueFilteredRecommender
 
 
@@ -15,33 +14,23 @@ class MatchingEngine:
 
     def __init__(self):
         self.data_loader = DataLoader()
-        self.interaction_graph = InteractionGraph()
         self.als_model = ALSModel()
         self.engagement_model = EngagementScorer()
         self.elo_model = EloRatingSystem()
-        self.recommender = None  # Initialized after run_popularity()
+        self.recommender = None  # Initialized after leagues are assigned
         self.interaction_df = None
         self.user_df = None
 
-    def load_interactions(self, 
-                          data_path: str, 
-                          decider_col: str, 
-                          other_col: str, 
-                          like_col: str,
-                          timestamp_col: str,
-                          gender_col: Optional[str] = None
-                          ) -> None:
-        """
-        Loads data into interaction matrix, interaction graph, and fits ALS
-        
-        Args:
-            data_path: Path to CSV file containing interaction data
-            decider_col: Column name for the user making the decision
-            other_col: Column name for the target user
-            like_col: Column name for the interaction type (like/dislike)  
-            timestamp_col: Column name for the timestamp
-            gender_col: Column name for the decider's gender (will infer other genders assuming heterosexual interactions)
-        """
+    def load_interactions(
+        self,
+        data_path: str,
+        decider_col: str,
+        other_col: str,
+        like_col: str,
+        timestamp_col: str,
+        gender_col: Optional[str] = None,
+    ) -> None:
+        """Load interactions into memory and fit the ALS model."""
         try:
             print("Reading data... ", end="")
             # Load the data (validation happens inside DataLoader)
@@ -49,15 +38,6 @@ class MatchingEngine:
             # Populate class attributes after loading
             self.interaction_df = self.data_loader.interaction_df
             self.user_df = self.data_loader.user_df
-            print("✅")
-
-            print("Constructing graph... ", end="")
-            self.interaction_graph.build_graph(
-                self.interaction_df, 
-                decider_col, 
-                other_col, 
-                like_col
-            )
             print("✅")
 
             print("Fitting ALS... ")
@@ -77,72 +57,11 @@ class MatchingEngine:
             traceback.print_exc()
             return
 
-    def run_popularity(self):
-        """
-        Computes popularity-based features for users.
-        
-        Returns:
-            pd.DataFrame: DataFrame containing user features based on popularity models.
-        """
-        # Remove existing popularity columns to avoid conflicts
-        popularity_columns = ['pagerank', 'likes_received', 'swipes_received', 'weighted_likes_received', 
-                            'weighted_swipes_received', 'in_like_rate_raw', 'in_like_rate_weighted',
-                            'in_like_rate_smoothed', 'popularity_confidence', 'popularity_score']
-        
-        existing_columns = list(self.user_df.columns)
-        columns_to_drop = [col for col in existing_columns if any(pop_col in col for pop_col in popularity_columns)]
-        
-        if columns_to_drop:
-            self.user_df = self.user_df.drop(columns=columns_to_drop)
-        
-        # Calculate PageRank as a measure of popularity (from graph class)
-        pagerank_scores = self.interaction_graph.get_pagerank()
-        self.user_df = self.user_df.merge(pagerank_scores, on='user_id', how='left')
-
-        # Calculate in-like rate statistics (standalone function)
-        decider_col = self.data_loader.metadata['decider_col']
-        other_col = self.data_loader.metadata['other_col']
-        like_col = self.data_loader.metadata['like_col']
-        timestamp_col = self.data_loader.metadata['timestamp_col']
-        
-        like_stats = get_like_stats(
-            self.interaction_df, 
-            decider_col, 
-            other_col, 
-            like_col, 
-            timestamp_col=timestamp_col,
-            recency_halflife_days=30.0,
-            min_swipes=3
-        )
-        self.user_df = self.user_df.merge(like_stats, on='user_id', how='left')
-
-        # Assign balanced leagues by gender using PageRank
-        # Only assign leagues to users who are in the ALS model (have sufficient interactions)
-        try:
-            # Get ALL users that appear in ANY ALS model
-            male_ids_in_als = set(self.als_model.male_map.keys()) | set(self.als_model.male_map_f2m.keys())
-            female_ids_in_als = set(self.als_model.female_map.keys()) | set(self.als_model.female_map_f2m.keys())
-            als_user_ids = male_ids_in_als | female_ids_in_als
-            
-            # Filter to only ALS users for league assignment
-            als_users_df = self.user_df[self.user_df['user_id'].isin(als_user_ids)]
-            
-            if len(als_users_df) > 0:
-                leagues = assign_balanced_leagues(als_users_df, pagerank_col='pagerank', gender_col='gender')
-                self.user_df = self.user_df.merge(leagues[['user_id', 'league']], on='user_id', how='left')
-            else:
-                print("⚠️ No users in ALS model for league assignment")
-        except Exception as e:
-            # Don't fail the pipeline if leagues can't be assigned; just log
-            print(f"⚠️ League assignment skipped: {e}")
-
-        print("User DF updated ✅")
-    
     def build_recommender(self, use_gpu: bool = True):
         """
         Build FAISS-based league-filtered recommender.
         
-        Must be called after run_popularity() to ensure leagues are assigned.
+        Must be called after run_elo() to ensure leagues are assigned.
         
         Args:
             use_gpu: Whether to use GPU for FAISS indices (default True)
@@ -151,7 +70,7 @@ class MatchingEngine:
             raise ValueError("Data not loaded. Call load_interactions() first.")
         
         if 'league' not in self.user_df.columns:
-            raise ValueError("Leagues not assigned. Call run_popularity() first.")
+            raise ValueError("Leagues not assigned. Call run_elo() first.")
         
         try:
             print("Building FAISS recommender... ", end="")
@@ -193,11 +112,11 @@ class MatchingEngine:
     
     def run_elo(self, config: EloConfig | None = None) -> pd.DataFrame:
         """
-        Compute ELO ratings.
-        
+        Compute ELO ratings and assign leagues based on gender-specific percentiles.
+
         Args:
             config: ELO configuration (uses defaults if None)
-            
+
         Returns:
             DataFrame with ELO ratings merged into user_df
         """
@@ -213,8 +132,6 @@ class MatchingEngine:
 
         if config is not None:
             self.elo_model = EloRatingSystem(config)
-
-        print("Computing ELO ratings... ", end="", flush=True)
         
         # If gender_col is specified, we need to join gender info into interactions
         interactions_with_gender = self.interaction_df
@@ -246,10 +163,17 @@ class MatchingEngine:
         # Drop gender from elo_scores if it exists (user_df already has it)
         if 'gender' in elo_scores.columns:
             elo_scores = elo_scores.drop(columns=['gender'])
-        
+
         # Merge ELO scores
         self.user_df = self.user_df.merge(elo_scores, on='user_id', how='left')
-        
+
+        # Assign leagues based on updated ELO ratings
+        if 'league' in self.user_df.columns:
+            self.user_df = self.user_df.drop(columns=['league'])
+
+        league_assignments = assign_leagues_from_elo(self.user_df, self.als_model)
+        self.user_df = self.user_df.merge(league_assignments, on='user_id', how='left')
+
         print("User DF updated ✅")
 
     def is_ready(self) -> bool:
@@ -272,7 +196,7 @@ class MatchingEngine:
             List of (candidate_id, mutual_score) tuples, sorted by score descending
         """
         if self.recommender is None:
-            raise ValueError("Recommender not initialized. Call run_popularity() first.")
+            raise ValueError("Recommender not initialized. Call run_elo() first.")
         
         # Get user metadata
         user_row = self.user_df[self.user_df['user_id'] == user_id]
@@ -301,7 +225,7 @@ class MatchingEngine:
             Dict mapping user_id -> [(candidate_id, mutual_score), ...]
         """
         if self.recommender is None:
-            raise ValueError("Recommender not initialized. Call run_popularity() first.")
+            raise ValueError("Recommender not initialized. Call run_elo() first.")
         
         # Build metadata dict with efficient single DataFrame operation
         user_ids_set = set(user_ids)
