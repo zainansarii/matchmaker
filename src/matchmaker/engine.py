@@ -250,18 +250,6 @@ class MatchingEngine:
         # Merge ELO scores
         self.user_df = self.user_df.merge(elo_scores, on='user_id', how='left')
         
-        print("✅")
-        
-        # Print summary if available
-        if self.elo_model.summary_ is not None:
-            summary = self.elo_model.summary_
-            print(f"\nELO Summary:")
-            print(f"  Users scored: {summary.total_users_scored}")
-            print(f"  Avg rating: {summary.avg_rating:.1f}")
-            print(f"  Median rating: {summary.median_rating:.1f}")
-            print(f"  Std dev: {summary.rating_std:.1f}")
-            print(f"  Stable users (≥{self.elo_model.config.min_interactions} interactions): {summary.stable_users}")
-        
         print("User DF updated ✅")
 
     def is_ready(self) -> bool:
