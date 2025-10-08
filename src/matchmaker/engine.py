@@ -6,6 +6,7 @@ from .data.loader import DataLoader
 from .models.popularity import InteractionGraph, get_like_stats, assign_balanced_leagues
 from .models.als import ALSModel
 from .models.engagement import EngagementScorer, EngagementConfig
+from .models.elo import EloRatingSystem, EloConfig
 from .serving.recommender import LeagueFilteredRecommender
 
 
@@ -17,6 +18,7 @@ class MatchingEngine:
         self.interaction_graph = InteractionGraph()
         self.als_model = ALSModel()
         self.engagement_model = EngagementScorer()
+        self.elo_model = EloRatingSystem()
         self.recommender = None  # Initialized after run_popularity()
         self.interaction_df = None
         self.user_df = None
@@ -187,6 +189,79 @@ class MatchingEngine:
 
         self.user_df = self.user_df.merge(engagement_scores, on='user_id', how='left')
 
+        print("User DF updated ✅")
+    
+    def run_elo(self, config: EloConfig | None = None) -> pd.DataFrame:
+        """
+        Compute ELO ratings.
+        
+        Args:
+            config: ELO configuration (uses defaults if None)
+            
+        Returns:
+            DataFrame with ELO ratings merged into user_df
+        """
+        if not self.is_ready():
+            raise ValueError("Data not loaded. Call load_interactions() first.")
+
+        metadata = self.data_loader.metadata
+        decider_col = metadata['decider_col']
+        other_col = metadata['other_col']
+        like_col = metadata['like_col']
+        timestamp_col = metadata.get('timestamp_col')
+        gender_col = metadata.get('gender_col')
+
+        if config is not None:
+            self.elo_model = EloRatingSystem(config)
+
+        print("Computing ELO ratings... ", end="", flush=True)
+        
+        # If gender_col is specified, we need to join gender info into interactions
+        interactions_with_gender = self.interaction_df
+        if gender_col is not None:
+            # Join gender from user_df to interaction_df
+            gender_lookup = self.user_df[['user_id', 'gender']].rename(
+                columns={'user_id': decider_col, 'gender': gender_col}
+            )
+            interactions_with_gender = self.interaction_df.merge(
+                gender_lookup, on=decider_col, how='left'
+            )
+        
+        elo_scores = self.elo_model.score(
+            interactions_with_gender,
+            decider_col=decider_col,
+            other_col=other_col,
+            like_col=like_col,
+            timestamp_col=timestamp_col,
+            gender_col=gender_col
+        )
+        
+        # Remove existing ELO columns if they exist
+        elo_columns = ['elo_rating', 'interaction_count', 'is_stable']
+        existing_cols = list(self.user_df.columns)
+        cols_to_drop = [col for col in existing_cols if col in elo_columns]
+        if cols_to_drop:
+            self.user_df = self.user_df.drop(columns=cols_to_drop)
+        
+        # Drop gender from elo_scores if it exists (user_df already has it)
+        if 'gender' in elo_scores.columns:
+            elo_scores = elo_scores.drop(columns=['gender'])
+        
+        # Merge ELO scores
+        self.user_df = self.user_df.merge(elo_scores, on='user_id', how='left')
+        
+        print("✅")
+        
+        # Print summary if available
+        if self.elo_model.summary_ is not None:
+            summary = self.elo_model.summary_
+            print(f"\nELO Summary:")
+            print(f"  Users scored: {summary.total_users_scored}")
+            print(f"  Avg rating: {summary.avg_rating:.1f}")
+            print(f"  Median rating: {summary.median_rating:.1f}")
+            print(f"  Std dev: {summary.rating_std:.1f}")
+            print(f"  Stable users (≥{self.elo_model.config.min_interactions} interactions): {summary.stable_users}")
+        
         print("User DF updated ✅")
 
     def is_ready(self) -> bool:
