@@ -6,7 +6,7 @@ from .data.loader import DataLoader
 from .models.als import ALSModel
 from .models.engagement import EngagementScorer, EngagementConfig
 from .models.elo import EloRatingSystem, EloConfig, assign_leagues_from_elo
-from .serving.recommender import LeagueFilteredRecommender
+from .serving import LeagueFilteredRecommender, ALSFaissRecommender
 
 
 class MatchingEngine:
@@ -18,6 +18,7 @@ class MatchingEngine:
         self.engagement_model = EngagementScorer()
         self.elo_model = EloRatingSystem()
         self.recommender = None  # Initialized after leagues are assigned
+        self.recommender_variant: Optional[str] = None
         self.interaction_df = None
         self.user_df = None
 
@@ -57,32 +58,50 @@ class MatchingEngine:
             traceback.print_exc()
             return
 
-    def build_recommender(self, use_gpu: bool = True):
+    def build_recommender(self, variant: str = "pop", use_gpu: bool = True):
         """
-        Build FAISS-based league-filtered recommender.
-        
-        Must be called after run_elo() to ensure leagues are assigned.
-        
+        Build a FAISS-based recommender.
+
         Args:
-            use_gpu: Whether to use GPU for FAISS indices (default True)
+            variant: Which serving strategy to use. Supported values:
+                - "pop": league-filtered recommender that enforces attractiveness tiers.
+                - "vanilla": ALS + FAISS without league constraints.
+            use_gpu: Whether to use GPU-backed FAISS indices when available (default True).
+
+        Notes:
+            The "pop" variant requires leagues computed via ``run_elo``.
         """
         if not self.is_ready():
             raise ValueError("Data not loaded. Call load_interactions() first.")
         
-        if 'league' not in self.user_df.columns:
-            raise ValueError("Leagues not assigned. Call run_elo() first.")
-        
+        normalized_variant = variant.lower()
+        if normalized_variant not in {"pop", "vanilla"}:
+            raise ValueError("variant must be either 'pop' or 'vanilla'")
+
         try:
-            print("Building FAISS recommender... ", end="")
-            self.recommender = LeagueFilteredRecommender(
-                als_model=self.als_model,
-                user_df=self.user_df,
-                use_gpu=use_gpu
-            )
+            if normalized_variant == "pop":
+                if 'league' not in self.user_df.columns:
+                    raise ValueError("Leagues not assigned. Call run_elo() first to use the 'pop' recommender.")
+
+                print("Building FAISS recommender (pop)... ", end="")
+                self.recommender = LeagueFilteredRecommender(
+                    als_model=self.als_model,
+                    user_df=self.user_df,
+                    use_gpu=use_gpu
+                )
+            else:
+                print("Building FAISS recommender (vanilla)... ", end="")
+                self.recommender = ALSFaissRecommender(
+                    als_model=self.als_model,
+                    use_gpu=use_gpu
+                )
+
+            self.recommender_variant = normalized_variant
             print("✅")
         except Exception as e:
             print(f"⚠️ FAISS recommender initialization failed: {e}")
             self.recommender = None
+            self.recommender_variant = None
             raise
 
     def run_engagement(self, config: EngagementConfig | None = None) -> pd.DataFrame:
@@ -195,8 +214,8 @@ class MatchingEngine:
         Returns:
             List of (candidate_id, mutual_score) tuples, sorted by score descending
         """
-        if self.recommender is None:
-            raise ValueError("Recommender not initialized. Call run_elo() first.")
+        if self.recommender is None or self.recommender_variant is None:
+            raise ValueError("Recommender not initialized. Call build_recommender() first.")
         
         # Get user metadata
         user_row = self.user_df[self.user_df['user_id'] == user_id]
@@ -204,14 +223,23 @@ class MatchingEngine:
             return []
         
         gender = user_row['gender'].iloc[0]
-        league = user_row['league'].iloc[0]
-        
-        if gender == 'M':
-            return self.recommender.recommend_for_male(user_id, league, k)
-        elif gender == 'F':
-            return self.recommender.recommend_for_female(user_id, league, k)
-        else:
+        league = user_row['league'].iloc[0] if 'league' in user_row.columns else None
+
+        if self.recommender_variant == "pop":
+            if league is None:
+                raise ValueError("League information missing for user; cannot use 'pop' recommender.")
+            if gender == 'M':
+                return self.recommender.recommend_for_male(user_id, league, k)
+            if gender == 'F':
+                return self.recommender.recommend_for_female(user_id, league, k)
             return []
+
+        # Vanilla fallback (no league filtering)
+        if gender == 'M':
+            return self.recommender.recommend_for_male(user_id, k)
+        if gender == 'F':
+            return self.recommender.recommend_for_female(user_id, k)
+        return []
     
     def recommend_batch(self, user_ids: List[int], k: int = 1000) -> Dict[int, List[Tuple[int, float]]]:
         """
@@ -224,23 +252,30 @@ class MatchingEngine:
         Returns:
             Dict mapping user_id -> [(candidate_id, mutual_score), ...]
         """
-        if self.recommender is None:
-            raise ValueError("Recommender not initialized. Call run_elo() first.")
+        if self.recommender is None or self.recommender_variant is None:
+            raise ValueError("Recommender not initialized. Call build_recommender() first.")
         
         # Build metadata dict with efficient single DataFrame operation
         user_ids_set = set(user_ids)
         
+        columns = ['user_id', 'gender']
+        has_league = 'league' in self.user_df.columns
+        if has_league:
+            columns.append('league')
+
         # Convert to pandas if needed for faster iteration
         if isinstance(self.user_df, cudf.DataFrame):
-            users_subset = self.user_df[self.user_df['user_id'].isin(user_ids_set)][['user_id', 'gender', 'league']].to_pandas()
+            users_subset = self.user_df[self.user_df['user_id'].isin(user_ids_set)][columns].to_pandas()
         else:
-            users_subset = self.user_df[self.user_df['user_id'].isin(user_ids_set)][['user_id', 'gender', 'league']]
+            users_subset = self.user_df[self.user_df['user_id'].isin(user_ids_set)][columns]
         
         # Build metadata dict from the subset
-        user_metadata = {
-            row['user_id']: {'gender': row['gender'], 'league': row['league']}
-            for _, row in users_subset.iterrows()
-        }
+        user_metadata: Dict[int, Dict[str, Optional[str]]] = {}
+        for _, row in users_subset.iterrows():
+            meta = {'gender': row['gender']}
+            if has_league:
+                meta['league'] = row['league']
+            user_metadata[row['user_id']] = meta
         
         return self.recommender.recommend_batch(user_ids, user_metadata, k)
 

@@ -4,7 +4,7 @@ from .engine import MatchingEngine
 from .models.als import ALSModel
 from .models.engagement import EngagementScorer, EngagementConfig
 from .models.elo import EloRatingSystem, EloConfig, assign_leagues_from_elo
-from .serving.recommender import LeagueFilteredRecommender
+from .serving import LeagueFilteredRecommender, ALSFaissRecommender
 
 __all__ = [
     'MatchingEngine',
@@ -14,5 +14,6 @@ __all__ = [
     'EloRatingSystem',
     'EloConfig',
     'assign_leagues_from_elo',
-    'LeagueFilteredRecommender'
+    'LeagueFilteredRecommender',
+    'ALSFaissRecommender',
 ]
