@@ -1,415 +1,411 @@
-"""
-FAISS-based recommendation system for large-scale matching.
+"""GPU-only FAISS recommender for league-aware matching."""
 
-This module provides GPU-accelerated approximate nearest neighbor search
-filtered by league for scalable recommendations to millions of users.
-"""
+from __future__ import annotations
 
+from typing import Any, Dict, List, Optional, Tuple
+
+import faiss  # type: ignore
 import numpy as np
-import cupy as cp
-import cudf
 import pandas as pd
-from typing import Dict, List, Tuple, Optional, Any
-import warnings
-import faiss
+
+try:  # pragma: no cover - optional dependency for user convenience
+    import cudf  # type: ignore
+except ImportError:  # pragma: no cover - cudf not required for CPU tests
+    cudf = None
 
 
 class LeagueFilteredRecommender:
-    """
-    FAISS-based recommender that filters candidates by league before ranking by mutual score.
-    
-    For dating apps, this ensures users are matched within their attractiveness tier
-    while leveraging fast ANN search for scalability.
-    """
-    
+    """GPU-only FAISS recommender that filters candidates by league before scoring."""
+
+    LEAGUES: Tuple[str, ...] = ("Bronze", "Silver", "Gold", "Platinum", "Diamond")
+    OVERFETCH_MULTIPLIER: float = 3.0
+
     def __init__(self, als_model, user_df: pd.DataFrame, use_gpu: bool = True):
-        """
-        Initialize recommender with ALS model and user metadata.
-        
-        Args:
-            als_model: Trained ALSModel with male/female factors
-            user_df: DataFrame with columns [user_id, gender, league]
-            use_gpu: Whether to use GPU for FAISS (requires faiss-gpu)
-        """
-        
+        if not use_gpu:
+            raise ValueError("CPU execution is no longer supported; set use_gpu=True.")
+        if faiss.get_num_gpus() == 0:
+            raise RuntimeError(
+                "LeagueFilteredRecommender requires faiss-gpu with at least one CUDA device."
+            )
+
         self.als_model = als_model
-        self.use_gpu = use_gpu and faiss.get_num_gpus() > 0
-        
-        # Convert to pandas if needed
-        if isinstance(user_df, cudf.DataFrame):
+        self.gpu_resources = faiss.StandardGpuResources()
+        self.gpu_resources.setTempMemory(256 * 1024 * 1024)
+
+        if cudf is not None and isinstance(user_df, cudf.DataFrame):
             user_df = user_df.to_pandas()
-        
-        # Separate by gender and league
-        self._build_league_indices(user_df)
-        
-    def _build_league_indices(self, user_df: pd.DataFrame):
-        """Build FAISS indices for each gender and league combination."""
-        
-        # Extract male and female users
-        males_df = user_df[user_df['gender'] == 'M'].copy()
-        females_df = user_df[user_df['gender'] == 'F'].copy()
-        
-        # Initialize storage for indices
-        self.male_indices = {}  # league -> FAISS index
-        self.male_id_map = {}   # league -> [user_ids]
-        self.female_indices = {}
-        self.female_id_map = {}
-                
-        # Build indices for each league
-        leagues = ['Bronze', 'Silver', 'Gold', 'Platinum', 'Diamond']
-        
-        for league in leagues:
-            # Males in this league
-            league_males = males_df[males_df['league'] == league]
-            if len(league_males) > 0:
-                # Get IDs that are in EITHER M2F or F2M model
-                valid_ids = [uid for uid in league_males['user_id'].values 
-                            if uid in self.als_model.male_map or uid in self.als_model.male_map_f2m]
-                
-                if len(valid_ids) > 0:
-                    # Get factor embeddings for these males
-                    # Prefer M2F model (male_map), fall back to F2M (male_map_f2m)
-                    factors_list = []
-                    for uid in valid_ids:
-                        if uid in self.als_model.male_map:
-                            idx = self.als_model.male_map[uid]
-                            factors_list.append(self.als_model.male_factors[idx].get())
-                        else:
-                            # Use male_attr_factors from F2M model
-                            idx = self.als_model.male_map_f2m[uid]
-                            factors_list.append(self.als_model.male_attr_factors[idx].get())
-                    
-                    factors = np.vstack(factors_list)
-                    
-                    # Build FAISS index
-                    self.male_indices[league] = self._create_index(factors)
-                    self.male_id_map[league] = valid_ids
-            
-            # Females in this league  
-            league_females = females_df[females_df['league'] == league]
-            if len(league_females) > 0:
-                # Get IDs that are in EITHER M2F or F2M model
-                valid_ids = [uid for uid in league_females['user_id'].values 
-                            if uid in self.als_model.female_map or uid in self.als_model.female_map_f2m]
-                
-                if len(valid_ids) > 0:
-                    # Get factor embeddings for these females
-                    # Prefer M2F model (female_map), fall back to F2M (female_map_f2m)
-                    factors_list = []
-                    for uid in valid_ids:
-                        if uid in self.als_model.female_map:
-                            idx = self.als_model.female_map[uid]
-                            factors_list.append(self.als_model.female_factors[idx].get())
-                        else:
-                            # Use female_pref_factors from F2M model
-                            idx = self.als_model.female_map_f2m[uid]
-                            factors_list.append(self.als_model.female_pref_factors[idx].get())
-                    
-                    factors = np.vstack(factors_list)
-                    
-                    # Build FAISS index
-                    self.female_indices[league] = self._create_index(factors)
-                    self.female_id_map[league] = valid_ids
-            
-    def _create_index(self, factors: np.ndarray) -> Any:
-        """Create FAISS index from factor embeddings."""
-        d = factors.shape[1]  # dimensionality
-        
-        # For smaller datasets, use exact search (IndexFlatIP for inner product)
-        # For large datasets (>100k), use approximate search (IndexIVFFlat)
-        n = factors.shape[0]
-        
-        # Use CPU for small indices to save GPU memory
-        use_gpu_for_this_index = self.use_gpu and n > 5000
-        
-        if n < 100000:
-            # Exact search using inner product (cosine similarity on normalized vectors)
-            index = faiss.IndexFlatIP(d)
-        else:
-            # Approximate search with IVF (Inverted File Index)
-            nlist = min(int(np.sqrt(n)), 4096)  # number of clusters
-            quantizer = faiss.IndexFlatIP(d)
-            index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
-            index.train(factors.astype('float32'))
-            index.nprobe = min(32, nlist)  # number of clusters to search
-        
-        # Move to GPU only for larger indices
-        if use_gpu_for_this_index:
-            try:
-                res = faiss.StandardGpuResources()
-                # Limit temp memory to 256MB per index
-                res.setTempMemory(256 * 1024 * 1024)
-                index = faiss.index_cpu_to_gpu(res, 0, index)
-            except Exception as e:
-                # Fall back to CPU if GPU allocation fails
-                print(f"    Warning: GPU allocation failed for {n} vectors, using CPU: {e}")
-        
-        # Add vectors
-        index.add(factors.astype('float32'))
-        return index
-    
+        elif not isinstance(user_df, pd.DataFrame):
+            raise TypeError("user_df must be a pandas or cudf DataFrame.")
+
+        missing_cols = {"user_id", "gender", "league"} - set(user_df.columns)
+        if missing_cols:
+            raise ValueError(f"user_df is missing required columns: {sorted(missing_cols)}")
+
+        males_df = user_df[user_df["gender"] == "M"]
+        females_df = user_df[user_df["gender"] == "F"]
+
+        self.male_indices, self.male_id_map = self._build_indices_by_league(
+            frame=males_df,
+            primary_map=self.als_model.male_map,
+            primary_factors=self.als_model.male_factors,
+            fallback_map=self.als_model.male_map_f2m,
+            fallback_factors=self.als_model.male_attr_factors,
+        )
+        self.female_indices, self.female_id_map = self._build_indices_by_league(
+            frame=females_df,
+            primary_map=self.als_model.female_map,
+            primary_factors=self.als_model.female_factors,
+            fallback_map=self.als_model.female_map_f2m,
+            fallback_factors=self.als_model.female_pref_factors,
+        )
+
     def recommend_for_male(self, male_id: int, league: str, k: int = 1000) -> List[Tuple[int, float]]:
-        """
-        Recommend top-k females in the same league for a male user.
-        
-        Args:
-            male_id: Male user ID
-            league: User's league (Bronze/Silver/Gold/Platinum/Diamond)
-            k: Number of recommendations to return
-            
-        Returns:
-            List of (female_id, mutual_score) tuples, sorted by score descending
-        """
-        if male_id not in self.als_model.male_map:
-            return []
-        
-        if league not in self.female_indices:
-            return []  # No females in this league
-        
-        # Get male's factor embedding
-        m_idx = self.als_model.male_map[male_id]
-        male_factor = self.als_model.male_factors[m_idx].get().reshape(1, -1)
-        
-        # Search FAISS index for top-k females in same league
-        index = self.female_indices[league]
-        k_search = min(k, len(self.female_id_map[league]))
-        
-        distances, indices = index.search(male_factor.astype('float32'), k_search)
-        
-        # Map FAISS indices back to user IDs and compute mutual scores in batch
-        candidate_ids = []
-        for idx in indices[0]:
-            if idx == -1:  # FAISS returns -1 for empty results
-                continue
-            female_id = self.female_id_map[league][idx]
-            candidate_ids.append(female_id)
-        
-        # Batch compute mutual scores
-        if candidate_ids:
-            pairs = [(male_id, fid) for fid in candidate_ids]
-            mutual_scores = self.als_model.mutual_score_batch(pairs)
-            
-            recommendations = [(fid, float(score)) for fid, score in zip(candidate_ids, mutual_scores) if score > 0]
-        else:
-            recommendations = []
-        
-        # Sort by mutual score descending
-        recommendations.sort(key=lambda x: x[1], reverse=True)
-        return recommendations[:k]
-    
+        """Return top-k female candidates for a male user in the same league."""
+
+        return self._recommend_single(
+            user_id=male_id,
+            league=league,
+            query_map=self.als_model.male_map,
+            query_factors=self.als_model.male_factors,
+            candidate_indices=self.female_indices,
+            candidate_id_map=self.female_id_map,
+            pair_builder=lambda uid, cid: (uid, cid),
+            k=k,
+        )
+
     def recommend_for_female(self, female_id: int, league: str, k: int = 1000) -> List[Tuple[int, float]]:
-        """
-        Recommend top-k males in the same league for a female user.
-        
-        Args:
-            female_id: Female user ID
-            league: User's league (Bronze/Silver/Gold/Platinum/Diamond)
-            k: Number of recommendations to return
-            
-        Returns:
-            List of (male_id, mutual_score) tuples, sorted by score descending
-        """
-        if female_id not in self.als_model.female_map_f2m:
-            return []
-        
-        if league not in self.male_indices:
-            return []  # No males in this league
-        
-        # Get female's preference factor embedding (from F2M model)
-        f_idx = self.als_model.female_map_f2m[female_id]
-        female_factor = self.als_model.female_pref_factors[f_idx].get().reshape(1, -1)
-        
-        # Search FAISS index for top-k males in same league
-        index = self.male_indices[league]
-        k_search = min(k, len(self.male_id_map[league]))
-        
-        distances, indices = index.search(female_factor.astype('float32'), k_search)
-        
-        # Map FAISS indices back to user IDs and compute mutual scores in batch
-        candidate_ids = []
-        for idx in indices[0]:
-            if idx == -1:
-                continue
-            male_id = self.male_id_map[league][idx]
-            candidate_ids.append(male_id)
-        
-        # Batch compute mutual scores
-        if candidate_ids:
-            pairs = [(mid, female_id) for mid in candidate_ids]
-            mutual_scores = self.als_model.mutual_score_batch(pairs)
-            
-            recommendations = [(mid, float(score)) for mid, score in zip(candidate_ids, mutual_scores) if score > 0]
-        else:
-            recommendations = []
-        
-        # Sort by mutual score descending
-        recommendations.sort(key=lambda x: x[1], reverse=True)
-        return recommendations[:k]
-    
-    def recommend_batch(self, user_ids: List[int], user_metadata: Dict[int, Dict[str, str]], 
-                       k: int = 1000) -> Dict[int, List[Tuple[int, float]]]:
-        """
-        Batch recommend for multiple users with optimized FAISS batch search.
-        
-        Args:
-            user_ids: List of user IDs
-            user_metadata: Dict mapping user_id -> {'gender': 'M'/'F', 'league': 'Gold', ...}
-            k: Number of recommendations per user
-            
-        Returns:
-            Dict mapping user_id -> [(candidate_id, mutual_score), ...]
-        """
-        results = {}
-        
-        # Group users by (gender, league) for batched FAISS queries
-        groups = {}  # (gender, league) -> [user_ids]
+        """Return top-k male candidates for a female user in the same league."""
+
+        return self._recommend_single(
+            user_id=female_id,
+            league=league,
+            query_map=self.als_model.female_map_f2m,
+            query_factors=self.als_model.female_pref_factors,
+            candidate_indices=self.male_indices,
+            candidate_id_map=self.male_id_map,
+            pair_builder=lambda uid, cid: (cid, uid),
+            k=k,
+        )
+
+    def recommend_batch(
+        self,
+        user_ids: List[int],
+        user_metadata: Dict[int, Dict[str, str]],
+        k: int = 1000,
+    ) -> Dict[int, List[Tuple[int, float]]]:
+        """Batch recommend for multiple users grouped by gender and league."""
+
+        results: Dict[int, List[Tuple[int, float]]] = {}
+        groups: Dict[Tuple[str, str], List[int]] = {}
+
         for uid in user_ids:
-            if uid not in user_metadata:
+            meta = user_metadata.get(uid)
+            if not meta:
                 results[uid] = []
                 continue
-            
-            meta = user_metadata[uid]
-            gender = meta.get('gender')
-            league = meta.get('league')
-            key = (gender, league)
-            
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(uid)
-        
-        # Process each group with batch FAISS search
-        for (gender, league), group_uids in groups.items():
-            if gender == 'M':
-                group_results = self._batch_recommend_males(group_uids, league, k)
-            elif gender == 'F':
-                group_results = self._batch_recommend_females(group_uids, league, k)
+
+            gender = meta.get("gender")
+            league = meta.get("league")
+            if gender not in {"M", "F"} or not league:
+                results[uid] = []
+                continue
+
+            groups.setdefault((gender, league), []).append(uid)
+
+        for (gender, league), group_ids in groups.items():
+            if gender == "M":
+                group_results = self._batch_recommend(
+                    user_ids=group_ids,
+                    league=league,
+                    query_map=self.als_model.male_map,
+                    query_factors=self.als_model.male_factors,
+                    candidate_indices=self.female_indices,
+                    candidate_id_map=self.female_id_map,
+                    pair_builder=lambda uid, cid: (uid, cid),
+                    k=k,
+                )
             else:
-                group_results = {uid: [] for uid in group_uids}
-            
+                group_results = self._batch_recommend(
+                    user_ids=group_ids,
+                    league=league,
+                    query_map=self.als_model.female_map_f2m,
+                    query_factors=self.als_model.female_pref_factors,
+                    candidate_indices=self.male_indices,
+                    candidate_id_map=self.male_id_map,
+                    pair_builder=lambda uid, cid: (cid, uid),
+                    k=k,
+                )
+
             results.update(group_results)
-        
+
+        for uid in user_ids:
+            results.setdefault(uid, [])
+
         return results
-    
-    def _batch_recommend_males(self, male_ids: List[int], league: str, k: int) -> Dict[int, List[Tuple[int, float]]]:
-        """Batch recommend females for multiple males in the same league."""
-        if league not in self.female_indices:
-            return {mid: [] for mid in male_ids}
-        
-        # Filter to valid males and get their factors
-        valid_pairs = []  # (male_id, factor_array)
-        for mid in male_ids:
-            if mid in self.als_model.male_map:
-                m_idx = self.als_model.male_map[mid]
-                male_factor = self.als_model.male_factors[m_idx].get()
-                valid_pairs.append((mid, male_factor))
-        
-        if not valid_pairs:
-            return {mid: [] for mid in male_ids}
-        
-        # Stack all male factors into a single matrix for batch search
-        male_ids_ordered, factors_list = zip(*valid_pairs)
-        query_matrix = np.vstack(factors_list).astype('float32')
-        
-        # Batch FAISS search - ONE call for all males
-        index = self.female_indices[league]
-        k_search = min(k, len(self.female_id_map[league]))
-        distances, indices = index.search(query_matrix, k_search)
-        
-        # Collect ALL pairs for batch mutual scoring
-        all_pairs = []
-        pair_to_user = []  # Track which user each pair belongs to
-        
-        for i, mid in enumerate(male_ids_ordered):
-            for idx in indices[i]:
-                if idx == -1:
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _allowed_leagues(self, league: str) -> Tuple[str, ...]:
+        if league not in self.LEAGUES:
+            return (league,)
+        idx = self.LEAGUES.index(league)
+        start = max(0, idx - 1)
+        end = min(len(self.LEAGUES), idx + 2)
+        return self.LEAGUES[start:end]
+
+    @staticmethod
+    def _dedupe_preserve_order(items: List[int]) -> List[int]:
+        seen: set[int] = set()
+        deduped: List[int] = []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        return deduped
+
+    def _build_indices_by_league(
+        self,
+        frame: pd.DataFrame,
+        primary_map: Dict[int, int],
+        primary_factors: Any,
+        fallback_map: Dict[int, int],
+        fallback_factors: Any,
+    ) -> Tuple[Dict[str, Any], Dict[str, List[int]]]:
+        indices: Dict[str, Any] = {}
+        id_maps: Dict[str, List[int]] = {}
+
+        for league in self.LEAGUES:
+            league_ids = frame.loc[frame["league"] == league, "user_id"].tolist()
+            if not league_ids:
+                continue
+
+            vectors, valid_ids = self._collect_candidate_vectors(
+                league_ids,
+                primary_map,
+                primary_factors,
+                fallback_map,
+                fallback_factors,
+            )
+
+            if vectors is None:
+                continue
+
+            indices[league] = self._create_gpu_index(vectors)
+            id_maps[league] = valid_ids
+
+        return indices, id_maps
+
+    def _collect_candidate_vectors(
+        self,
+        user_ids: List[int],
+        primary_map: Dict[int, int],
+        primary_factors: Any,
+        fallback_map: Dict[int, int],
+        fallback_factors: Any,
+    ) -> Tuple[Optional[np.ndarray], List[int]]:
+        vectors: List[np.ndarray] = []
+        valid_ids: List[int] = []
+
+        for uid in user_ids:
+            if uid in primary_map:
+                idx = primary_map[uid]
+                vectors.append(np.asarray(primary_factors[idx].get(), dtype=np.float32))
+                valid_ids.append(uid)
+            elif uid in fallback_map:
+                idx = fallback_map[uid]
+                vectors.append(np.asarray(fallback_factors[idx].get(), dtype=np.float32))
+                valid_ids.append(uid)
+
+        if not vectors:
+            return None, []
+
+        stacked = np.vstack(vectors).astype("float32")
+        return stacked, valid_ids
+
+    def _create_gpu_index(self, vectors: np.ndarray) -> Any:
+        dim = vectors.shape[1]
+        index = faiss.GpuIndexFlatIP(self.gpu_resources, dim)
+        index.add(vectors.astype("float32", copy=False))
+        return index
+
+    def _extract_query_vector(
+        self, user_id: int, query_map: Dict[int, int], query_factors: Any
+    ) -> Optional[np.ndarray]:
+        idx = query_map.get(user_id)
+        if idx is None:
+            return None
+
+        vector = np.asarray(query_factors[idx].get(), dtype=np.float32)
+        return vector.reshape(1, -1)
+
+    def _search_candidates(
+        self, query: np.ndarray, index: Any, id_map: List[int], limit: int
+    ) -> List[int]:
+        if limit <= 0:
+            return []
+        if not id_map:
+            return []
+
+        k_search = min(limit, len(id_map))
+        _, candidate_indices = index.search(query.astype("float32", copy=False), k_search)
+        return [id_map[idx] for idx in candidate_indices[0] if idx != -1]
+
+    def _recommend_single(
+        self,
+        user_id: int,
+        league: str,
+        query_map: Dict[int, int],
+        query_factors: Any,
+        candidate_indices: Dict[str, Any],
+        candidate_id_map: Dict[str, List[int]],
+        pair_builder,
+        k: int,
+    ) -> List[Tuple[int, float]]:
+        allowed_leagues = self._allowed_leagues(league)
+        available_leagues = [lvl for lvl in allowed_leagues if lvl in candidate_indices]
+
+        if not available_leagues:
+            return []
+
+        query_vector = self._extract_query_vector(user_id, query_map, query_factors)
+        if query_vector is None:
+            return []
+
+        total_available = sum(len(candidate_id_map.get(lvl, [])) for lvl in available_leagues)
+        if total_available == 0:
+            return []
+
+        candidate_ids: List[int] = []
+        max_candidates = min(total_available, max(k, int(k * self.OVERFETCH_MULTIPLIER)))
+
+        for allowed_league in available_leagues:
+            if len(candidate_ids) >= max_candidates:
+                break
+            index = candidate_indices.get(allowed_league)
+            id_map = candidate_id_map.get(allowed_league)
+            if index is None or not id_map:
+                continue
+            remaining = max_candidates - len(candidate_ids)
+            if remaining <= 0:
+                break
+            candidate_ids.extend(
+                self._search_candidates(query_vector, index, id_map, remaining)
+            )
+
+        candidate_ids = self._dedupe_preserve_order(candidate_ids)
+        candidate_ids = candidate_ids[:max_candidates]
+
+        if not candidate_ids:
+            return []
+
+        pairs = [pair_builder(user_id, cid) for cid in candidate_ids]
+        scores = np.asarray(self.als_model.mutual_score_batch(pairs), dtype=np.float32)
+
+        recommendations = [
+            (cid, float(score)) for cid, score in zip(candidate_ids, scores) if score > 0
+        ]
+        recommendations.sort(key=lambda x: x[1], reverse=True)
+        return recommendations[:k]
+
+    def _collect_query_matrix(
+        self,
+        user_ids: List[int],
+        query_map: Dict[int, int],
+        query_factors: Any,
+    ) -> Tuple[List[int], Optional[np.ndarray]]:
+        vectors: List[np.ndarray] = []
+        valid_ids: List[int] = []
+
+        for uid in user_ids:
+            idx = query_map.get(uid)
+            if idx is None:
+                continue
+
+            vectors.append(np.asarray(query_factors[idx].get(), dtype=np.float32))
+            valid_ids.append(uid)
+
+        if not vectors:
+            return [], None
+
+        matrix = np.vstack(vectors).astype("float32")
+        return valid_ids, matrix
+
+    def _batch_recommend(
+        self,
+        user_ids: List[int],
+        league: str,
+        query_map: Dict[int, int],
+        query_factors: Any,
+        candidate_indices: Dict[str, Any],
+        candidate_id_map: Dict[str, List[int]],
+        pair_builder,
+        k: int,
+    ) -> Dict[int, List[Tuple[int, float]]]:
+        results = {uid: [] for uid in user_ids}
+
+        allowed_leagues = self._allowed_leagues(league)
+        available_leagues = [lvl for lvl in allowed_leagues if lvl in candidate_indices]
+
+        if not available_leagues:
+            return results
+
+        valid_ids, query_matrix = self._collect_query_matrix(user_ids, query_map, query_factors)
+        if query_matrix is None:
+            return results
+
+        total_available = sum(len(candidate_id_map.get(lvl, [])) for lvl in available_leagues)
+        if total_available == 0:
+            return results
+
+        per_user_candidates: Dict[int, List[int]] = {uid: [] for uid in valid_ids}
+        pairs: List[Tuple[int, int]] = []
+        owners: List[int] = []
+        candidates: List[int] = []
+        max_per_user = min(total_available, max(k, int(k * self.OVERFETCH_MULTIPLIER)))
+
+        for allowed_league in available_leagues:
+            index = candidate_indices.get(allowed_league)
+            id_map = candidate_id_map.get(allowed_league)
+            if index is None or not id_map:
+                continue
+
+            k_search = min(max_per_user, len(id_map))
+            if k_search == 0:
+                continue
+
+            _, candidate_matrix = index.search(query_matrix, k_search)
+
+            for row_idx, uid in enumerate(valid_ids):
+                if len(per_user_candidates[uid]) >= max_per_user:
                     continue
-                female_id = self.female_id_map[league][idx]
-                all_pairs.append((mid, female_id))
-                pair_to_user.append(i)  # Track user index
-        
-        # Single batch mutual score computation for ALL pairs
-        if all_pairs:
-            all_scores = self.als_model.mutual_score_batch(all_pairs)
-            
-            # Group results by user
-            user_recommendations = {mid: [] for mid in male_ids_ordered}
-            for pair_idx, ((mid, fid), score) in enumerate(zip(all_pairs, all_scores)):
-                if score > 0:
-                    user_recommendations[mid].append((fid, float(score)))
-            
-            # Sort each user's recommendations
-            results = {}
-            for mid in male_ids_ordered:
-                recs = user_recommendations[mid]
-                recs.sort(key=lambda x: x[1], reverse=True)
-                results[mid] = recs[:k]
-        else:
-            results = {mid: [] for mid in male_ids_ordered}
-        
-        # Add empty results for invalid males
-        for mid in male_ids:
-            if mid not in results:
-                results[mid] = []
-        
-        return results
-    
-    def _batch_recommend_females(self, female_ids: List[int], league: str, k: int) -> Dict[int, List[Tuple[int, float]]]:
-        """Batch recommend males for multiple females in the same league."""
-        if league not in self.male_indices:
-            return {fid: [] for fid in female_ids}
-        
-        # Filter to valid females and get their factors
-        valid_pairs = []  # (female_id, factor_array)
-        for fid in female_ids:
-            if fid in self.als_model.female_map_f2m:
-                f_idx = self.als_model.female_map_f2m[fid]
-                female_factor = self.als_model.female_pref_factors[f_idx].get()
-                valid_pairs.append((fid, female_factor))
-        
-        if not valid_pairs:
-            return {fid: [] for fid in female_ids}
-        
-        # Stack all female factors into a single matrix for batch search
-        female_ids_ordered, factors_list = zip(*valid_pairs)
-        query_matrix = np.vstack(factors_list).astype('float32')
-        
-        # Batch FAISS search - ONE call for all females
-        index = self.male_indices[league]
-        k_search = min(k, len(self.male_id_map[league]))
-        distances, indices = index.search(query_matrix, k_search)
-        
-        # Collect ALL pairs for batch mutual scoring
-        all_pairs = []
-        
-        for i, fid in enumerate(female_ids_ordered):
-            for idx in indices[i]:
-                if idx == -1:
-                    continue
-                male_id = self.male_id_map[league][idx]
-                all_pairs.append((male_id, fid))
-        
-        # Single batch mutual score computation for ALL pairs
-        if all_pairs:
-            all_scores = self.als_model.mutual_score_batch(all_pairs)
-            
-            # Group results by female user
-            user_recommendations = {fid: [] for fid in female_ids_ordered}
-            for (mid, fid), score in zip(all_pairs, all_scores):
-                if score > 0:
-                    user_recommendations[fid].append((mid, float(score)))
-            
-            # Sort each user's recommendations
-            results = {}
-            for fid in female_ids_ordered:
-                recs = user_recommendations[fid]
-                recs.sort(key=lambda x: x[1], reverse=True)
-                results[fid] = recs[:k]
-        else:
-            results = {fid: [] for fid in female_ids_ordered}
-        
-        # Add empty results for invalid females
-        for fid in female_ids:
-            if fid not in results:
-                results[fid] = []
-        
+                for candidate_idx in candidate_matrix[row_idx]:
+                    if candidate_idx == -1:
+                        continue
+                    candidate_id = id_map[candidate_idx]
+                    if candidate_id in per_user_candidates[uid]:
+                        continue
+                    per_user_candidates[uid].append(candidate_id)
+                    pairs.append(pair_builder(uid, candidate_id))
+                    owners.append(uid)
+                    candidates.append(candidate_id)
+                    if len(per_user_candidates[uid]) >= max_per_user:
+                        break
+
+        if not pairs:
+            return results
+
+        scores = np.asarray(self.als_model.mutual_score_batch(pairs), dtype=np.float32)
+        per_user: Dict[int, List[Tuple[int, float]]] = {uid: [] for uid in valid_ids}
+
+        for owner, candidate_id, score in zip(owners, candidates, scores):
+            if score > 0:
+                per_user.setdefault(owner, []).append((candidate_id, float(score)))
+
+        for uid in valid_ids:
+            recs = per_user.get(uid, [])
+            recs.sort(key=lambda x: x[1], reverse=True)
+            results[uid] = recs[:k]
+
         return results

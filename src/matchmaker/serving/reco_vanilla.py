@@ -1,286 +1,307 @@
-"""
-FAISS-based recommender that operates purely on ALS factors without league constraints.
-
-This module mirrors the league-aware recommender but indexes all candidates of a given
-gender together, enabling ablation studies that compare performance with and without
-league filtering.
-"""
+"""GPU-only FAISS recommender that uses ALS factors without league filtering."""
 
 from __future__ import annotations
 
+from typing import Any, Dict, List, Optional, Tuple
+
+import faiss  # type: ignore
 import numpy as np
-import faiss
-from typing import Dict, List, Tuple, Any, Optional
 
 
 class ALSFaissRecommender:
-    """FAISS-backed recommender that uses ALS factors without league filtering."""
+    """Simplified GPU-only recommender without league constraints."""
 
     def __init__(self, als_model, use_gpu: bool = True):
+        if not use_gpu:
+            raise ValueError("CPU execution is no longer supported; set use_gpu=True.")
+        if faiss.get_num_gpus() == 0:
+            raise RuntimeError(
+                "ALSFaissRecommender requires faiss-gpu with at least one CUDA device."
+            )
+
         self.als_model = als_model
-        self.use_gpu = use_gpu and faiss.get_num_gpus() > 0
+        self.gpu_resources = faiss.StandardGpuResources()
+        self.gpu_resources.setTempMemory(256 * 1024 * 1024)
 
-        self.female_index: Optional[Any] = None
-        self.female_id_map: List[int] = []
-        self.male_index: Optional[Any] = None
-        self.male_id_map: List[int] = []
+        self.female_index, self.female_id_map = self._build_candidate_index(
+            sorted(
+                set(self.als_model.female_map.keys())
+                | set(self.als_model.female_map_f2m.keys())
+            ),
+            primary_map=self.als_model.female_map,
+            primary_factors=self.als_model.female_factors,
+            fallback_map=self.als_model.female_map_f2m,
+            fallback_factors=self.als_model.female_pref_factors,
+        )
 
-        self._build_gender_indices()
-
-    def _build_gender_indices(self) -> None:
-        """Build FAISS indices for female and male candidate pools."""
-
-        # Females as candidates for males
-        female_ids = sorted(set(self.als_model.female_map.keys()) | set(self.als_model.female_map_f2m.keys()))
-        if female_ids:
-            female_vectors = []
-            valid_female_ids = []
-            for fid in female_ids:
-                if fid in self.als_model.female_map:
-                    idx = self.als_model.female_map[fid]
-                    female_vectors.append(self.als_model.female_factors[idx].get())
-                    valid_female_ids.append(fid)
-                elif fid in self.als_model.female_map_f2m:
-                    idx = self.als_model.female_map_f2m[fid]
-                    female_vectors.append(self.als_model.female_pref_factors[idx].get())
-                    valid_female_ids.append(fid)
-
-            if female_vectors:
-                factors = np.vstack(female_vectors)
-                self.female_index = self._create_index(factors)
-                self.female_id_map = valid_female_ids
-
-        # Males as candidates for females
-        male_ids = sorted(set(self.als_model.male_map.keys()) | set(self.als_model.male_map_f2m.keys()))
-        if male_ids:
-            male_vectors = []
-            valid_male_ids = []
-            for mid in male_ids:
-                if mid in self.als_model.male_map:
-                    idx = self.als_model.male_map[mid]
-                    male_vectors.append(self.als_model.male_factors[idx].get())
-                    valid_male_ids.append(mid)
-                elif mid in self.als_model.male_map_f2m:
-                    idx = self.als_model.male_map_f2m[mid]
-                    male_vectors.append(self.als_model.male_attr_factors[idx].get())
-                    valid_male_ids.append(mid)
-
-            if male_vectors:
-                factors = np.vstack(male_vectors)
-                self.male_index = self._create_index(factors)
-                self.male_id_map = valid_male_ids
-
-    def _create_index(self, factors: np.ndarray) -> Any:
-        """Create a FAISS index from factor embeddings."""
-        d = factors.shape[1]
-        n = factors.shape[0]
-
-        use_gpu_for_index = self.use_gpu and n > 5000
-
-        if n < 100000:
-            index = faiss.IndexFlatIP(d)
-        else:
-            nlist = min(int(np.sqrt(n)), 4096)
-            quantizer = faiss.IndexFlatIP(d)
-            index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
-            index.train(factors.astype("float32"))
-            index.nprobe = min(32, nlist)
-
-        if use_gpu_for_index:
-            try:
-                res = faiss.StandardGpuResources()
-                res.setTempMemory(256 * 1024 * 1024)
-                index = faiss.index_cpu_to_gpu(res, 0, index)
-            except Exception as exc:  # pragma: no cover - defensive, GPU specific
-                print(f"Warning: Falling back to CPU FAISS index ({n} vectors): {exc}")
-
-        index.add(factors.astype("float32"))
-        return index
-
-    # ------------------------------------------------------------------
-    # Individual recommendation entry-points
-    # ------------------------------------------------------------------
+        self.male_index, self.male_id_map = self._build_candidate_index(
+            sorted(
+                set(self.als_model.male_map.keys()) | set(self.als_model.male_map_f2m.keys())
+            ),
+            primary_map=self.als_model.male_map,
+            primary_factors=self.als_model.male_factors,
+            fallback_map=self.als_model.male_map_f2m,
+            fallback_factors=self.als_model.male_attr_factors,
+        )
 
     def recommend_for_male(self, male_id: int, k: int = 1000) -> List[Tuple[int, float]]:
         """Return top-k female candidates for a male user."""
-        if self.female_index is None:
-            return []
-        if male_id not in self.als_model.male_map:
-            return []
 
-        m_idx = self.als_model.male_map[male_id]
-        male_factor = self.als_model.male_factors[m_idx].get().reshape(1, -1)
-
-        k_search = min(k, len(self.female_id_map))
-        distances, indices = self.female_index.search(male_factor.astype("float32"), k_search)
-
-        candidate_ids = []
-        for idx in indices[0]:
-            if idx == -1:
-                continue
-            candidate_ids.append(self.female_id_map[idx])
-
-        if not candidate_ids:
-            return []
-
-        pairs = [(male_id, fid) for fid in candidate_ids]
-        scores = self.als_model.mutual_score_batch(pairs)
-
-        recs = [(fid, float(score)) for fid, score in zip(candidate_ids, scores) if score > 0]
-        recs.sort(key=lambda x: x[1], reverse=True)
-        return recs[:k]
+        return self._recommend_single(
+            user_id=male_id,
+            query_map=self.als_model.male_map,
+            query_factors=self.als_model.male_factors,
+            candidate_index=self.female_index,
+            candidate_ids=self.female_id_map,
+            pair_builder=lambda uid, cid: (uid, cid),
+            k=k,
+        )
 
     def recommend_for_female(self, female_id: int, k: int = 1000) -> List[Tuple[int, float]]:
         """Return top-k male candidates for a female user."""
-        if self.male_index is None:
-            return []
-        if female_id not in self.als_model.female_map_f2m:
-            return []
 
-        f_idx = self.als_model.female_map_f2m[female_id]
-        female_factor = self.als_model.female_pref_factors[f_idx].get().reshape(1, -1)
+        return self._recommend_single(
+            user_id=female_id,
+            query_map=self.als_model.female_map_f2m,
+            query_factors=self.als_model.female_pref_factors,
+            candidate_index=self.male_index,
+            candidate_ids=self.male_id_map,
+            pair_builder=lambda uid, cid: (cid, uid),
+            k=k,
+        )
 
-        k_search = min(k, len(self.male_id_map))
-        distances, indices = self.male_index.search(female_factor.astype("float32"), k_search)
+    def recommend_batch(
+        self,
+        user_ids: List[int],
+        user_metadata: Dict[int, Dict[str, str]],
+        k: int = 1000,
+    ) -> Dict[int, List[Tuple[int, float]]]:
+        """Batch recommend for multiple users grouped by gender."""
 
-        candidate_ids = []
-        for idx in indices[0]:
-            if idx == -1:
-                continue
-            candidate_ids.append(self.male_id_map[idx])
-
-        if not candidate_ids:
-            return []
-
-        pairs = [(mid, female_id) for mid in candidate_ids]
-        scores = self.als_model.mutual_score_batch(pairs)
-
-        recs = [(mid, float(score)) for mid, score in zip(candidate_ids, scores) if score > 0]
-        recs.sort(key=lambda x: x[1], reverse=True)
-        return recs[:k]
-
-    # ------------------------------------------------------------------
-    # Batch interfaces
-    # ------------------------------------------------------------------
-
-    def recommend_batch(self, user_ids: List[int], user_metadata: Dict[int, Dict[str, str]],
-                        k: int = 1000) -> Dict[int, List[Tuple[int, float]]]:
-        """Batch recommend for multiple users grouped only by gender."""
-        groups: Dict[str, List[int]] = {"M": [], "F": []}
         results: Dict[int, List[Tuple[int, float]]] = {}
+        male_ids: List[int] = []
+        female_ids: List[int] = []
 
         for uid in user_ids:
             meta = user_metadata.get(uid)
             if not meta:
                 results[uid] = []
                 continue
+
             gender = meta.get("gender")
-            if gender in groups:
-                groups[gender].append(uid)
+            if gender == "M":
+                male_ids.append(uid)
+            elif gender == "F":
+                female_ids.append(uid)
             else:
                 results[uid] = []
 
-        if groups["M"]:
-            results.update(self._batch_recommend_males(groups["M"], k))
-        if groups["F"]:
-            results.update(self._batch_recommend_females(groups["F"], k))
+        if male_ids:
+            results.update(
+                self._batch_recommend(
+                    user_ids=male_ids,
+                    query_map=self.als_model.male_map,
+                    query_factors=self.als_model.male_factors,
+                    candidate_index=self.female_index,
+                    candidate_ids=self.female_id_map,
+                    pair_builder=lambda uid, cid: (uid, cid),
+                    k=k,
+                )
+            )
 
-        # Ensure any users with missing metadata are present
+        if female_ids:
+            results.update(
+                self._batch_recommend(
+                    user_ids=female_ids,
+                    query_map=self.als_model.female_map_f2m,
+                    query_factors=self.als_model.female_pref_factors,
+                    candidate_index=self.male_index,
+                    candidate_ids=self.male_id_map,
+                    pair_builder=lambda uid, cid: (cid, uid),
+                    k=k,
+                )
+            )
+
         for uid in user_ids:
             results.setdefault(uid, [])
 
         return results
 
-    def _batch_recommend_males(self, male_ids: List[int], k: int) -> Dict[int, List[Tuple[int, float]]]:
-        if self.female_index is None:
-            return {mid: [] for mid in male_ids}
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        valid_pairs = []
-        for mid in male_ids:
-            if mid in self.als_model.male_map:
-                idx = self.als_model.male_map[mid]
-                valid_pairs.append((mid, self.als_model.male_factors[idx].get()))
+    def _build_candidate_index(
+        self,
+        user_ids: List[int],
+        primary_map: Dict[int, int],
+        primary_factors: Any,
+        fallback_map: Dict[int, int],
+        fallback_factors: Any,
+    ) -> Tuple[Optional[Any], List[int]]:
+        vectors, valid_ids = self._collect_candidate_vectors(
+            user_ids, primary_map, primary_factors, fallback_map, fallback_factors
+        )
 
-        if not valid_pairs:
-            return {mid: [] for mid in male_ids}
+        if vectors is None:
+            return None, []
 
-        male_ids_ordered, factors = zip(*valid_pairs)
-        query_matrix = np.vstack(factors).astype("float32")
+        return self._create_gpu_index(vectors), valid_ids
 
-        k_search = min(k, len(self.female_id_map))
-        distances, indices = self.female_index.search(query_matrix, k_search)
+    def _collect_candidate_vectors(
+        self,
+        user_ids: List[int],
+        primary_map: Dict[int, int],
+        primary_factors: Any,
+        fallback_map: Dict[int, int],
+        fallback_factors: Any,
+    ) -> Tuple[Optional[np.ndarray], List[int]]:
+        vectors: List[np.ndarray] = []
+        valid_ids: List[int] = []
 
-        all_pairs: List[Tuple[int, int]] = []
-        pairs_by_user: Dict[int, List[int]] = {mid: [] for mid in male_ids_ordered}
-        for row_idx, mid in enumerate(male_ids_ordered):
-            for col_idx in indices[row_idx]:
-                if col_idx == -1:
+        for uid in user_ids:
+            if uid in primary_map:
+                idx = primary_map[uid]
+                vectors.append(np.asarray(primary_factors[idx].get(), dtype=np.float32))
+                valid_ids.append(uid)
+            elif uid in fallback_map:
+                idx = fallback_map[uid]
+                vectors.append(np.asarray(fallback_factors[idx].get(), dtype=np.float32))
+                valid_ids.append(uid)
+
+        if not vectors:
+            return None, []
+
+        stacked = np.vstack(vectors).astype("float32")
+        return stacked, valid_ids
+
+    def _create_gpu_index(self, vectors: np.ndarray) -> Any:
+        dim = vectors.shape[1]
+        index = faiss.GpuIndexFlatIP(self.gpu_resources, dim)
+        index.add(vectors.astype("float32", copy=False))
+        return index
+
+    def _extract_query_vector(
+        self, user_id: int, query_map: Dict[int, int], query_factors: Any
+    ) -> Optional[np.ndarray]:
+        idx = query_map.get(user_id)
+        if idx is None:
+            return None
+
+        vector = np.asarray(query_factors[idx].get(), dtype=np.float32)
+        return vector.reshape(1, -1)
+
+    def _recommend_single(
+        self,
+        user_id: int,
+        query_map: Dict[int, int],
+        query_factors: Any,
+        candidate_index: Optional[Any],
+        candidate_ids: List[int],
+        pair_builder,
+        k: int,
+    ) -> List[Tuple[int, float]]:
+        if candidate_index is None or not candidate_ids:
+            return []
+
+        query_vector = self._extract_query_vector(user_id, query_map, query_factors)
+        if query_vector is None:
+            return []
+
+        candidate_list = self._search_candidates(query_vector, candidate_index, candidate_ids, k)
+        if not candidate_list:
+            return []
+
+        pairs = [pair_builder(user_id, cid) for cid in candidate_list]
+        scores = np.asarray(self.als_model.mutual_score_batch(pairs), dtype=np.float32)
+
+        recommendations = [
+            (cid, float(score)) for cid, score in zip(candidate_list, scores) if score > 0
+        ]
+        recommendations.sort(key=lambda x: x[1], reverse=True)
+        return recommendations[:k]
+
+    def _collect_query_matrix(
+        self,
+        user_ids: List[int],
+        query_map: Dict[int, int],
+        query_factors: Any,
+    ) -> Tuple[List[int], Optional[np.ndarray]]:
+        vectors: List[np.ndarray] = []
+        valid_ids: List[int] = []
+
+        for uid in user_ids:
+            idx = query_map.get(uid)
+            if idx is None:
+                continue
+
+            vectors.append(np.asarray(query_factors[idx].get(), dtype=np.float32))
+            valid_ids.append(uid)
+
+        if not vectors:
+            return [], None
+
+        matrix = np.vstack(vectors).astype("float32")
+        return valid_ids, matrix
+
+    def _batch_recommend(
+        self,
+        user_ids: List[int],
+        query_map: Dict[int, int],
+        query_factors: Any,
+        candidate_index: Optional[Any],
+        candidate_ids: List[int],
+        pair_builder,
+        k: int,
+    ) -> Dict[int, List[Tuple[int, float]]]:
+        results = {uid: [] for uid in user_ids}
+
+        if candidate_index is None or not candidate_ids:
+            return results
+
+        valid_ids, query_matrix = self._collect_query_matrix(user_ids, query_map, query_factors)
+        if query_matrix is None:
+            return results
+
+        k_search = min(k, len(candidate_ids))
+        _, candidate_matrix = candidate_index.search(query_matrix, k_search)
+
+        pairs: List[Tuple[int, int]] = []
+        owners: List[int] = []
+        scored_candidates: List[int] = []
+
+        for row_idx, uid in enumerate(valid_ids):
+            for candidate_idx in candidate_matrix[row_idx]:
+                if candidate_idx == -1:
                     continue
-                fid = self.female_id_map[col_idx]
-                all_pairs.append((mid, fid))
-                pairs_by_user[mid].append(fid)
+                candidate_id = candidate_ids[candidate_idx]
+                pairs.append(pair_builder(uid, candidate_id))
+                owners.append(uid)
+                scored_candidates.append(candidate_id)
 
-        if not all_pairs:
-            return {mid: [] for mid in male_ids}
+        if not pairs:
+            return results
 
-        scores = self.als_model.mutual_score_batch(all_pairs)
+        scores = np.asarray(self.als_model.mutual_score_batch(pairs), dtype=np.float32)
+        per_user: Dict[int, List[Tuple[int, float]]] = {}
 
-        results: Dict[int, List[Tuple[int, float]]] = {mid: [] for mid in male_ids}
-        score_iter = iter(scores)
-        for mid in male_ids_ordered:
-            recs = []
-            for fid in pairs_by_user[mid]:
-                score = float(next(score_iter))
-                if score > 0:
-                    recs.append((fid, score))
+        for owner, candidate_id, score in zip(owners, scored_candidates, scores):
+            if score > 0:
+                per_user.setdefault(owner, []).append((candidate_id, float(score)))
+
+        for uid in user_ids:
+            recs = per_user.get(uid, [])
             recs.sort(key=lambda x: x[1], reverse=True)
-            results[mid] = recs[:k]
+            results[uid] = recs[:k]
 
         return results
 
-    def _batch_recommend_females(self, female_ids: List[int], k: int) -> Dict[int, List[Tuple[int, float]]]:
-        if self.male_index is None:
-            return {fid: [] for fid in female_ids}
+    def _search_candidates(
+        self, query: np.ndarray, index: Any, id_map: List[int], limit: int
+    ) -> List[int]:
+        if not id_map:
+            return []
 
-        valid_pairs = []
-        for fid in female_ids:
-            if fid in self.als_model.female_map_f2m:
-                idx = self.als_model.female_map_f2m[fid]
-                valid_pairs.append((fid, self.als_model.female_pref_factors[idx].get()))
-
-        if not valid_pairs:
-            return {fid: [] for fid in female_ids}
-
-        female_ids_ordered, factors = zip(*valid_pairs)
-        query_matrix = np.vstack(factors).astype("float32")
-
-        k_search = min(k, len(self.male_id_map))
-        distances, indices = self.male_index.search(query_matrix, k_search)
-
-        all_pairs: List[Tuple[int, int]] = []
-        pairs_by_user: Dict[int, List[int]] = {fid: [] for fid in female_ids_ordered}
-        for row_idx, fid in enumerate(female_ids_ordered):
-            for col_idx in indices[row_idx]:
-                if col_idx == -1:
-                    continue
-                mid = self.male_id_map[col_idx]
-                all_pairs.append((mid, fid))
-                pairs_by_user[fid].append(mid)
-
-        if not all_pairs:
-            return {fid: [] for fid in female_ids}
-
-        scores = self.als_model.mutual_score_batch(all_pairs)
-
-        results: Dict[int, List[Tuple[int, float]]] = {fid: [] for fid in female_ids}
-        score_iter = iter(scores)
-        for fid in female_ids_ordered:
-            recs = []
-            for mid in pairs_by_user[fid]:
-                score = float(next(score_iter))
-                if score > 0:
-                    recs.append((mid, score))
-            recs.sort(key=lambda x: x[1], reverse=True)
-            results[fid] = recs[:k]
-
-        return results
+        k_search = min(limit, len(id_map))
+        _, candidate_indices = index.search(query.astype("float32", copy=False), k_search)
+        return [id_map[idx] for idx in candidate_indices[0] if idx != -1]

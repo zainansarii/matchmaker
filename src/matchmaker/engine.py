@@ -66,13 +66,16 @@ class MatchingEngine:
             variant: Which serving strategy to use. Supported values:
                 - "pop": league-filtered recommender that enforces attractiveness tiers.
                 - "vanilla": ALS + FAISS without league constraints.
-            use_gpu: Whether to use GPU-backed FAISS indices when available (default True).
+            use_gpu: Must remain True; CPU execution is no longer supported.
 
         Notes:
             The "pop" variant requires leagues computed via ``run_elo``.
         """
         if not self.is_ready():
             raise ValueError("Data not loaded. Call load_interactions() first.")
+
+        if not use_gpu:
+            raise ValueError("GPU is required for FAISS recommenders; CPU fallback has been removed.")
         
         normalized_variant = variant.lower()
         if normalized_variant not in {"pop", "vanilla"}:
